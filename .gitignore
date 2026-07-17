@@ -1,0 +1,13 @@
+# PyInstaller
+dist/
+build/
+
+# Release archives
+release/
+
+# Python
+__pycache__/
+*.pyc
+
+# WorkBuddy workspace
+.workbuddy/
