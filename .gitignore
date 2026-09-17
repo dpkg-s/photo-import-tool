@@ -5,6 +5,9 @@ build/
 # Release archives
 release/
 
+# 本地打包备份（单个 exe 约 55MB，不入库）
+backup/
+
 # Python
 __pycache__/
 *.pyc

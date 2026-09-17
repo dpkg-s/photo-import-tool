@@ -1,6 +1,6 @@
-# -*- mode: python ; coding: utf-8 -*-
+﻿# -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec for 照片导入工具 v3.0
+PyInstaller spec for 照片导入工具 v4.0
 使用单文件模式（--onefile），无需解压，双击即可运行。
 """
 
@@ -10,7 +10,7 @@ block_cipher = None
 
 a = Analysis(
     ['PhotoImportTool.py'],
-    pathex=[r'D:\WorkBuddy\2026-06-26-14-36-49'],
+    pathex=[r'C:\Users\dpkg_\Documents\Codex\photo-import-tool'],
     binaries=[],
     datas=[],
     hiddenimports=['PIL', 'PIL._imaging', 'PIL.ExifTags'],
@@ -33,11 +33,11 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='照片导入工具v3',
+    name='照片快速导入工具v4',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
@@ -48,3 +48,4 @@ exe = EXE(
     entitlements_file=None,
     icon=None,
 )
+

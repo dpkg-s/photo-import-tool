@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-照片导入工具 v3
+照片快速导入工具 v4
 根据《使用文档_v3.txt》逆向工程实现。
 
 技术栈：Python 3.13 + PyQt5 + Pillow + PyInstaller
@@ -11,7 +11,7 @@
   - 检测含 DCIM 目录的存储设备
   - 按 EXIF/文件时间分类导入 RAW/JPG
   - 日志与进度直接显示在主窗口
-  - 导入开始时自动打开目标文件夹
+  - 导入后操作：不打开 / 打开（全部或最新，可选 RAW/JPG）
 """
 
 import sys
@@ -27,7 +27,7 @@ from ctypes import windll, WinError as WinErrorC
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QCheckBox, QGroupBox, QTextEdit, QProgressBar,
-    QFileDialog, QMessageBox, QFrame, QGridLayout, QSplitter
+    QFileDialog, QMessageBox, QFrame, QGridLayout, QSplitter, QRadioButton
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QThread
 from PyQt5.QtGui import QPalette, QColor, QFont
@@ -38,8 +38,8 @@ from PIL import Image
 # 常量定义
 # ---------------------------------------------------------------------------
 APP_NAME = "照片导入工具"
-APP_VERSION = "v3"
-MUTEX_NAME = "Global\\PhotoImportTool_v30"
+APP_VERSION = "v4"
+MUTEX_NAME = "Global\\PhotoImportTool_v40"
 REG_KEY_PATH = r"Software\\PhotoImportTool"
 
 RAW_EXTS = (".nef", ".raw", ".cr2", ".cr3", ".arw", ".orf", ".rw2", ".dng", ".nrw")
@@ -111,7 +111,9 @@ class RegistryConfig:
             "import_path": "",
             "date_format": "YYYY/MMDD",
             "excluded_drives": "CD",
-            "open_folder": "1",
+            "after_import": "open",
+            "open_scope": "all",
+            "open_types": "raw,jpg",
             "remark": "",
         }
         try:
@@ -154,7 +156,7 @@ def get_exif_date(image_path: Path) -> datetime | None:
     """从图像 EXIF 中读取 DateTimeOriginal (36867) 或 DateTime (306)。"""
     try:
         with Image.open(image_path) as img:
-            exif = img._getexif()
+            exif = img.getexif()
             if not exif:
                 return None
             dt = parse_exif_datetime(exif.get(36867))
@@ -239,17 +241,17 @@ class ImportWorker(QThread):
     """后台执行导入工作。"""
 
     def __init__(self, import_path: Path, date_format: str, remark: str,
-                 excluded_drives: set[str], open_folder: bool):
+                 excluded_drives: set[str]):
         super().__init__()
         self.signals = ImportSignals()
         self.import_path = import_path
         self.date_format = date_format
         self.remark = remark.strip()
         self.excluded_drives = excluded_drives
-        self.open_folder = open_folder
         self._abort = False
         self._result = defaultdict(int)
-        self._opened_dirs = set()
+        self._created_dirs: list[str] = []
+        self._seen_dirs: set[str] = set()
 
     def abort(self):
         self._abort = True
@@ -280,15 +282,6 @@ class ImportWorker(QThread):
         except Exception as e:
             self._log(f"[ERROR] 复制失败 {src.name}: {e}")
             return "FAIL"
-
-    def _open_dir_once(self, directory: Path):
-        if self.open_folder and directory not in self._opened_dirs:
-            self._opened_dirs.add(directory)
-            self._log(f"[OPEN] 正在打开 {directory}")
-            try:
-                os.startfile(str(directory))
-            except Exception as e:
-                self._log(f"[WARNING] 无法打开目录 {directory}: {e}")
 
     def run(self):
         try:
@@ -358,7 +351,13 @@ class ImportWorker(QThread):
                     self._log(f"[MKDIR] 创建目录: {dst_dir}")
                     self._result["created_dirs"] += 1
 
-                self._open_dir_once(dst_dir)
+                # 去重：同一目录会处理多个文件，若每个文件都 append，
+                # 「导入后打开」环节会对着同一目录重复调用 os.startfile 几十次。
+                # 用 set 守卫，同时保留首次出现的顺序（便于「最新」判定取末级）。
+                key = str(dst_dir)
+                if key not in self._seen_dirs:
+                    self._seen_dirs.add(key)
+                    self._created_dirs.append(key)
 
                 status = self._copy_file(src, dst)
                 size_mb = src.stat().st_size / (1024 * 1024)
@@ -384,16 +383,15 @@ class ImportWorker(QThread):
         if self._abort:
             return
 
-        # 步骤 4: 打开目标文件夹
-        self._log("")
-        self._log("[步骤 4/4] 打开目标文件夹...")
-
         raw_success = self._result.get("raw_success", 0)
         jpg_success = self._result.get("jpg_success", 0)
         skipped = self._result.get("skipped", 0)
         errors = self._result.get("errors", 0)
         created_dirs = self._result.get("created_dirs", 0)
 
+        # 步骤 4: 汇总
+        self._log("")
+        self._log("[步骤 4/4] 汇总结果...")
         self._log("")
         self._log("═" * 64)
         self._log("    导入完成!")
@@ -402,6 +400,8 @@ class ImportWorker(QThread):
         self._log(f"    跳过(重复): {skipped} 个")
         self._log(f"    出错:      {errors} 个")
         self._log(f"    创建目录:  {created_dirs} 个")
+        self._result["created_dirs_list"] = self._created_dirs
+
         self._log("═" * 64)
 
 
@@ -430,7 +430,7 @@ class ConfigWindow(QWidget):
         # 标题区
         title_layout = QVBoxLayout()
         title_layout.setSpacing(4)
-        title_label = QLabel("📷 照片导入工具 v3")
+        title_label = QLabel("📷 照片快速导入工具 v4")
         title_font = QFont("Microsoft YaHei", 16, QFont.Bold)
         title_label.setFont(title_font)
         title_label.setAlignment(Qt.AlignCenter)
@@ -518,10 +518,54 @@ class ConfigWindow(QWidget):
 
         config_layout.addLayout(form)
 
-        # 自动打开
-        self.chk_open = QCheckBox("导入时自动打开目标文件夹")
-        self.chk_open.setChecked(True)
-        config_layout.addWidget(self.chk_open)
+        # 导入后操作
+        after_frame = QFrame()
+        after_frame.setStyleSheet("background: transparent; border: none;")
+        after_layout = QVBoxLayout(after_frame)
+        after_layout.setContentsMargins(0, 4, 0, 0)
+        after_layout.setSpacing(6)
+        after_title = QLabel("导入后操作")
+        after_title.setStyleSheet("font-weight: bold; font-size: 12px;")
+        after_layout.addWidget(after_title)
+        radio_row = QHBoxLayout()
+        radio_row.setSpacing(10)
+        self.radio_not_open = QRadioButton("不打开")
+        self.radio_open = QRadioButton("打开")
+        self.radio_open.setChecked(True)
+        radio_row.addWidget(self.radio_not_open)
+        radio_row.addWidget(self.radio_open)
+        radio_row.addStretch()
+        after_layout.addLayout(radio_row)
+        open_opts_frame = QFrame()
+        open_opts_frame.setStyleSheet("background: #ffffff; border: 1px solid #ddd; border-radius: 4px;")
+        open_opts_layout = QVBoxLayout(open_opts_frame)
+        open_opts_layout.setContentsMargins(12, 8, 12, 8)
+        open_opts_layout.setSpacing(6)
+        scope_row = QHBoxLayout()
+        scope_row.addWidget(QLabel("作用范围:"))
+        self.radio_scope_all = QRadioButton("全部")
+        self.radio_scope_all.setChecked(True)
+        self.radio_scope_latest = QRadioButton("最新")
+        scope_row.addWidget(self.radio_scope_all)
+        scope_row.addWidget(self.radio_scope_latest)
+        scope_row.addStretch()
+        open_opts_layout.addLayout(scope_row)
+        type_row = QHBoxLayout()
+        type_row.addWidget(QLabel("打开类型:"))
+        self.chk_open_raw = QCheckBox("RAW")
+        self.chk_open_raw.setChecked(True)
+        self.chk_open_jpg = QCheckBox("JPG")
+        self.chk_open_jpg.setChecked(True)
+        type_row.addWidget(self.chk_open_raw)
+        type_row.addWidget(self.chk_open_jpg)
+        type_row.addStretch()
+        open_opts_layout.addLayout(type_row)
+        after_layout.addWidget(open_opts_frame)
+        def toggle_open_opts():
+            enabled = self.radio_open.isChecked()
+            open_opts_frame.setEnabled(enabled)
+        self.radio_not_open.toggled.connect(toggle_open_opts)
+        config_layout.addWidget(after_frame)
 
         main_layout.addWidget(config_card)
 
@@ -657,7 +701,13 @@ class ConfigWindow(QWidget):
         for letter, cb in self.check_drives.items():
             cb.setChecked(letter.upper() in excluded)
 
-        self.chk_open.setChecked(self.settings.get("open_folder", "1") == "1")
+        self.radio_open.setChecked(self.settings.get("after_import", "open") == "open")
+        self.radio_not_open.setChecked(self.settings.get("after_import", "open") == "none")
+        self.radio_scope_all.setChecked(self.settings.get("open_scope", "all") == "all")
+        self.radio_scope_latest.setChecked(self.settings.get("open_scope", "all") == "latest")
+        open_types = self.settings.get("open_types", "raw,jpg").split(",")
+        self.chk_open_raw.setChecked("raw" in open_types)
+        self.chk_open_jpg.setChecked("jpg" in open_types)
 
     def _collect_settings(self) -> dict:
         excluded = "".join(
@@ -667,8 +717,10 @@ class ConfigWindow(QWidget):
             "import_path": self.edit_path.text().strip(),
             "date_format": self.combo_date.currentText(),
             "excluded_drives": excluded,
-            "open_folder": "1" if self.chk_open.isChecked() else "0",
             "remark": self.edit_remark.text().strip(),
+            "after_import": "open" if self.radio_open.isChecked() else "none",
+            "open_scope": "all" if self.radio_scope_all.isChecked() else "latest",
+            "open_types": ",".join(t for t, c in [("raw", self.chk_open_raw), ("jpg", self.chk_open_jpg)] if c.isChecked()),
         }
 
     def save_settings_clicked(self):
@@ -684,7 +736,12 @@ class ConfigWindow(QWidget):
             cb.setChecked(False)
         self.check_drives.get("C", QCheckBox()).setChecked(True)
         self.check_drives.get("D", QCheckBox()).setChecked(True)
-        self.chk_open.setChecked(True)
+        self.radio_open.setChecked(True)
+        self.radio_not_open.setChecked(False)
+        self.radio_scope_all.setChecked(True)
+        self.radio_scope_latest.setChecked(False)
+        self.chk_open_raw.setChecked(True)
+        self.chk_open_jpg.setChecked(True)
         self.status_label.setText("已恢复默认设置。")
 
     def append_log(self, text: str):
@@ -717,7 +774,6 @@ class ConfigWindow(QWidget):
         }
         date_format = self.combo_date.currentText()
         remark = self.edit_remark.text().strip()
-        open_folder = self.chk_open.isChecked()
 
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
@@ -729,7 +785,7 @@ class ConfigWindow(QWidget):
         self.append_log(f"  {APP_NAME} {APP_VERSION}")
         self.append_log("═" * 64)
 
-        self._worker = ImportWorker(import_path, date_format, remark, excluded, open_folder)
+        self._worker = ImportWorker(import_path, date_format, remark, excluded)
         self._worker.signals.log.connect(self._on_log)
         self._worker.signals.progress.connect(self._on_progress)
         self._worker.signals.finished.connect(self._on_finished)
@@ -757,11 +813,98 @@ class ConfigWindow(QWidget):
         self.btn_stop.setEnabled(False)
         self.status_label.setText("导入完成。")
 
+        # 导入后操作：根据设置打开文件夹
+        if self.radio_open.isChecked() and result.get("created_dirs_list"):
+            created = [Path(d) for d in result["created_dirs_list"]]
+            if self.radio_scope_latest.isChecked():
+                import_path = Path(self.edit_path.text().strip())
+                # 「最新」以「日期目录」为单位，而不是路径第一级。
+                # 目标结构固定为 <日期目录>/<raw|jpg>，故 date_dir = d.parent。
+                # 不能取 rel.parts[0]：YYYY/MMDD 的格式串是 %Y\%m%d（反斜杠），
+                # Windows 上会被当作路径分隔符、生成两级目录（2026\0912_漫展），
+                # 取第一级会退化成「整年」，导致当年所有日期目录都被判为「最新」。
+                date_dirs = set()
+                for d in created:
+                    try:
+                        d.relative_to(import_path)
+                    except ValueError:
+                        continue          # 不在目标根目录下，忽略
+                    if d.parent != import_path:
+                        date_dirs.add(d.parent)
+                if date_dirs:
+                    latest_date_dir = max(date_dirs)
+                    # 用父目录相等判定，避免 startswith 的前缀误匹配（2026\09 与 2026\0912）
+                    created = [d for d in created if d.parent == latest_date_dir]
+            open_types_set = set()
+            if self.chk_open_raw.isChecked():
+                open_types_set.add("raw")
+            if self.chk_open_jpg.isChecked():
+                open_types_set.add("jpg")
+            for d in created:
+                if d.name in open_types_set:
+                    self.append_log(f"[OPEN] 正在打开 {d}")
+                    try:
+                        os.startfile(str(d))
+                    except Exception as e:
+                        self.append_log(f"[WARNING] 无法打开目录 {d}: {e}")
+
+
+def selftest():
+    """Headless 自检：模拟一次完整导入流程（ctypes + PIL + 拷贝），用于打包后验证闪退问题。"""
+    import tempfile
+    import shutil as _sh
+
+    def log(msg):
+        print(msg, flush=True)
+
+    log("[SELFTEST] 1/4 ctypes GetLogicalDrives 调用...")
+    drives = get_drive_letters()
+    log(f"           OK, 盘符: {''.join(drives)}")
+
+    log("[SELFTEST] 2/4 查找含 DCIM 的设备...")
+    devices = find_dcim_devices({'C', 'D', 'E'})
+    log(f"           发现 {len(devices)} 个设备: {devices}")
+
+    if not devices:
+        log("[SELFTEST] FAIL 未找到含 DCIM 设备")
+        return 1
+
+    log("[SELFTEST] 3/4 PIL 打开 NEF/JPG 读 EXIF...")
+    dcim = devices[0] / DCIM_NAME
+    test_file = None
+    for p in dcim.rglob('*'):
+        if p.suffix.lower() in RAW_EXTS or p.suffix.lower() in JPG_EXTS:
+            test_file = p
+            break
+    if not test_file:
+        log("[SELFTEST] FAIL 未找到测试照片")
+        return 1
+    dt = get_file_date(test_file)
+    log(f"           打开 {test_file.name} -> 日期 {dt}  OK")
+
+    log("[SELFTEST] 4/4 拷贝文件到临时目录...")
+    tmp = Path(tempfile.mkdtemp(prefix='phototool_selftest_'))
+    try:
+        dst = tmp / test_file.name
+        shutil.copy2(str(test_file), str(dst))
+        if dst.exists() and dst.stat().st_size == test_file.stat().st_size:
+            log(f"           拷贝 {test_file.name} ({dst.stat().st_size} bytes)  OK")
+        else:
+            log("[SELFTEST] FAIL 拷贝后大小不一致")
+            return 1
+    finally:
+        _sh.rmtree(tmp, ignore_errors=True)
+
+    log("[SELFTEST] 全部通过！")
+    return 0
+
 
 # ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 def main():
+    if '--selftest' in sys.argv:
+        sys.exit(selftest())
     single = SingleInstance(MUTEX_NAME)
     if not single.acquire():
         app = QApplication(sys.argv)
