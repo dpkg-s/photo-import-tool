@@ -1,6 +1,6 @@
 ﻿# -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec for 照片导入工具 v4.0
+PyInstaller spec for 照片导入工具 v5.0
 使用单文件模式（--onefile），无需解压，双击即可运行。
 """
 
@@ -33,7 +33,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='照片快速导入工具v4',
+    name='照片快速导入工具v5',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
