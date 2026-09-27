@@ -10,8 +10,8 @@
   - 配置持久化（Windows 注册表）
   - 检测含 DCIM 目录的存储设备（跳过网络盘/光驱，避免扫描卡顿）
   - 按 EXIF/文件时间分类导入 RAW/JPG
-  - 多设备分流导入：按机身序列号识别相机，认领后分流，
-    未勾选/未认领的机器按「机器名」自动建目录（如 D800E/2026/0427）
+  - 多设备分流导入：按机身序列号识别相机；只有勾选「导入此设备的照片」的
+    相机才导入（进各自路径），未勾选/未认领的本次跳过不导
   - 日志与进度直接显示在主窗口
   - 导入后操作：不打开 / 打开（全部或最新，可选 RAW/JPG）
 """
@@ -242,8 +242,8 @@ def parse_device_map_legacy(text: str) -> dict[str, str]:
 def device_root_for(cfg: dict, main_path: Path) -> Path:
     """算出某台设备的落盘根目录。
 
-    配了独立路径就用它（适合每台相机一个独立库）；否则退到
-    ``主导入路径/设备名``，与其他设备并列但不混装。
+    配了专属路径就用它（适合每台相机一个独立库）；否则退到
+    ``归档根目录/设备名``，与其他设备并列但不混装。
     """
     own = str(cfg.get("path", "")).strip()
     if own:
@@ -280,7 +280,7 @@ def suggest_device_name(model: str, serial: str = "") -> str:
 
 
 def device_dir_name(cfg: dict | None, entry: dict) -> str:
-    """算出设备目录名，供「未勾选 / 未认领」的设备自动建目录。
+    """算出设备目录名：用于「无序列号放行」建目录，以及跳过时的日志标签。
 
     优先级：配置里的设备名 > 机型自动推断 > 兜底。
 
@@ -880,9 +880,10 @@ class ImportWorker(QThread):
             self.signals.finished.emit(dict(self._result))
 
     def _run(self):
-        # 认领过设备 → 走分流；一台都没认领过才保持历史的全量行为
-        # （2026-09-28 起「未勾选」不再等于「不导入」，所以判据从
-        #  any(enabled) 放宽为 device_config 非空）
+        # 认领过设备 → 走分流，让「导入此设备的照片」这个总闸生效；
+        # 一台都没认领过才保持历史的全量行为（此时没有任何东西可勾）。
+        # 注意：判据**不能**是 any(enabled) —— 那样一台都没勾时会回落全量导入，
+        # 反而把不该导的照片混进主库。
         if self.device_config:
             self._run_split()
         else:
@@ -897,15 +898,15 @@ class ImportWorker(QThread):
     def _run_split(self):
         """按设备配置分流导入。
 
-        落盘根目录（base）后固定接 ``<日期目录>/<raw|jpg>``：
+        「导入此设备的照片」这个勾选就是总闸，落盘根目录（base）后固定接
+        ``<日期目录>/<raw|jpg>``：
 
-        - 已勾选设备 → 该设备自己的路径（留空则 ``<归档根目录>/<设备名>``）
-        - 未勾选设备 → ``<归档根目录>/<设备名>``（忽略独立路径，但不丢照片）
-        - 未认领设备 → ``<归档根目录>/<机型>``（机型自动推断）
-        - 读不到序列号 → ``<归档根目录>/<机型>``（安全模式，宁可多导）
+        - 已勾选 → 导入，落该设备自己的路径（留空则 ``<归档根目录>/<设备名>``）
+        - 未勾选 / 未认领 → **本次跳过，不导入，也不建任何目录**
+        - 读不到序列号 → ``<归档根目录>/<机型>``（安全模式：这类没法勾选，宁可多导）
 
         2026-09-28 起**取消 ``_他机`` / ``_未识别`` 两层**：目录名统一是可读的
-        机器名（如 ``D800E`` / ``Z_6_2``），而不是序列号。想让名字更好认，
+        机器名（如 ``D800E`` / ``Z-6_2``），而不是序列号。想让名字更好认，
         直接在界面「设备名」里改。
         """
         self._log("")
@@ -926,7 +927,7 @@ class ImportWorker(QThread):
 
         groups = []          # [(落盘根 Path, 设备标签, [文件...])]
         mine_total = 0
-        unchecked_total = 0
+        skipped_total = 0
         unknown_total = 0
 
         for serial, entry in sorted(stats.items(), key=lambda kv: -kv[1]["count"]):
@@ -939,6 +940,8 @@ class ImportWorker(QThread):
                       f"(RAW {entry['raw']} / JPG {entry['jpg']}){span}")
 
             if serial == UNKNOWN_DEVICE:
+                # 读不到序列号（截图、导出图等）：无法归属任何设备，也就没法勾选它。
+                # 这类保持安全模式放行，按机型建目录，宁可多导也不漏片。
                 unknown_total += entry["count"]
                 label = device_dir_name(None, entry)
                 base = self.import_path / label
@@ -950,36 +953,42 @@ class ImportWorker(QThread):
                 base = device_root_for(cfg, self.import_path)
                 self._log(f"         {label}: {detail}")
             else:
-                # 未勾选（已认领）或未认领：照常导入，落归档根目录下的机器名目录
-                unchecked_total += entry["count"]
+                # 未勾选（含未认领）→ 本次不导入。
+                # 开关「导入此设备的照片」就是总闸：不勾就不导，也不建任何目录。
+                skipped_total += entry["count"]
                 label = device_dir_name(cfg, entry)
-                base = self.import_path / label
+                reason = ("未勾选「导入此设备的照片」" if cfg
+                          else "未认领的相机（先在「设备」下拉里认领并勾选）")
                 self._log(f"         {label}: {detail}")
-                reason = "未勾选独立路径" if cfg else "未认领的相机"
-                self._log(f"            └ {reason}，按机器名归入归档根目录")
+                self._log(f"            └ {reason} → 本次跳过")
+                continue
 
             self._log(f"            → {base}")
             groups.append((base, label, files))
 
         if unknown_total:
             self._log(f"[INFO] {unknown_total} 张读不到序列号，按机型建目录放行")
-        if unchecked_total:
-            self._log(f"[INFO] {unchecked_total} 张来自未勾选/未认领的相机，"
-                      f"已归入归档根目录下的机器名目录（未丢弃）")
-        if mine_total == 0:
-            self._log("[WARNING] 本次没有命中任何已勾选设备")
-            self._log("         如需导入自己的照片，请在「多设备分流」里勾选对应相机")
+        if skipped_total:
+            self._log(f"[INFO] {skipped_total} 张来自未勾选/未认领的相机，本次跳过（未导入）")
 
         total = sum(len(files) for _, _, files in groups)
         if total == 0:
-            self._log("[WARNING] 未找到照片文件")
+            if skipped_total:
+                # 全部被总闸拦住：这时说「未找到照片文件」会让人以为卡没插好
+                self._log("[WARNING] 本次要导入的照片为 0 张 —— 卡内的相机都没勾选")
+                self._log("         想导入就勾上「导入此设备的照片」，再点开始导入")
+            elif mine_total == 0:
+                self._log("[WARNING] 本次没有命中任何已勾选的相机，不会有照片被导入")
+                self._log("         需要导入的话，请在「多设备分流」里勾选对应相机")
+            else:
+                self._log("[WARNING] 未找到照片文件")
             return
 
         # 步骤 3: 导入
         self._log("")
         self._log("[步骤 3/4] 开始导入...")
         self._log(f"[INFO] 分流模式:   多设备（已认领 {len(self.device_config)} 台，"
-                  f"勾选独立路径 {enabled_count} 台）")
+                  f"勾选导入 {enabled_count} 台）")
         self._log(f"[INFO] 日期格式:   {self.date_format}")
         if self.remark:
             self._log(f"[INFO] 备注:       {self.remark}")
@@ -1049,7 +1058,8 @@ class ImportWorker(QThread):
         """拷贝一组文件到 ``<base>/<日期目录>/<raw|jpg>``。
 
         base 是绝对落盘根目录：全量模式下即主导入路径；分流模式下为
-        设备自己的路径，或「归档根目录/机器名」。raw/jpg 分层由本方法统一补上。
+        已勾选设备自己的路径（留空则「归档根目录/设备名」），无序列号的按
+        「归档根目录/机型」。raw/jpg 分层由本方法统一补上。
         """
         self._log(f"[{label}] 共 {len(files)} 个文件")
         for src in files:
@@ -1331,14 +1341,14 @@ class ConfigWindow(QWidget):
         dev_layout.addLayout(dev_head)
 
         dev_hint = QLabel(
-            "按机身序列号分流：勾选的相机进各自独立路径；未勾选/未认领的相机"
-            "照常导入，落「归档根目录\\机器名」。"
+            "按机身序列号分流：勾选「导入此设备的照片」的相机才导入，进各自路径；"
+            "没勾的（含还没认领的）本次直接跳过，不导也不建目录。"
         )
         dev_hint.setStyleSheet("color: #666; font-size: 12px;")
         dev_hint.setWordWrap(True)
         dev_layout.addWidget(dev_hint)
 
-        # 归档根目录：全局唯一的路径，负责默认落盘与「机器名」子目录
+        # 归档根目录：全局唯一的路径，负责默认落盘与「设备名 / 机型」子目录
         arch_grid = QGridLayout()
         arch_grid.setSpacing(10)
         arch_grid.setColumnStretch(1, 1)
@@ -1355,8 +1365,8 @@ class ConfigWindow(QWidget):
         dev_layout.addLayout(arch_grid)
 
         arch_note = QLabel(
-            "用途：① 未勾选/未认领的相机按「本目录\\机器名」归档 "
-            "② 设备未填路径时用「本目录\\设备名」。"
+            "用途：① 设备勾选导入但没填路径时，落「本目录\\设备名」 "
+            "② 读不到序列号的相机按「本目录\\机型」放行。"
         )
         arch_note.setStyleSheet("color: #888; font-size: 12px;")
         arch_note.setWordWrap(True)
@@ -1385,11 +1395,11 @@ class ConfigWindow(QWidget):
         dp.setSpacing(8)
         dp.setColumnStretch(1, 1)
 
-        self.chk_dev_enabled = QCheckBox("使用独立导入路径")
+        self.chk_dev_enabled = QCheckBox("导入此设备的照片")
         self.chk_dev_enabled.setToolTip(
-            "勾选：照片进下面这个独立路径（你的主库）；\n"
-            "取消勾选：照常导入，但落「归档根目录\\设备名」。\n"
-            "两种都不会丢照片。")
+            "总开关：勾选才会导入这台相机的照片。\n"
+            "勾选：照片进下面这个路径（留空则落「归档根目录\\设备名」）；\n"
+            "取消勾选：本次直接跳过，不导入也不建目录。")
         self.chk_dev_enabled.toggled.connect(self._on_dev_enabled_toggled)
         dp.addWidget(self.chk_dev_enabled, 0, 0, 1, 2)
 
@@ -1519,7 +1529,7 @@ class ConfigWindow(QWidget):
             self.edit_path.setText(path)
 
     def choose_device_path(self):
-        """为当前选中的设备挑一个独立路径。"""
+        """为当前选中的设备挑一个专属导入路径。"""
         start = self.edit_dev_path.text().strip() or self.edit_path.text().strip()
         path = QFileDialog.getExistingDirectory(self, "选择该设备的导入目录", start)
         if path:
@@ -1613,10 +1623,17 @@ class ConfigWindow(QWidget):
         self.chk_open_jpg.setChecked(True)
         # 设备认领属于「身份认定」而非普通设置项：默认设置不清空它，
         # 只把总开关全部关掉，避免误操作后还要重新扫描认领一遍。
+        # 注意：「导入此设备的照片」是总闸，全关掉之后导入会跳过所有相机，
+        # 状态栏必须说清楚这一步的后果，免得用户以为工具坏了。
         for cfg in self.device_config:
             cfg["enabled"] = False
         self._refresh_device_combo()
-        self.status_label.setText("已恢复默认设置（设备认领已保留、开关已关闭）。")
+        if self.device_config:
+            self.status_label.setText(
+                "已恢复默认设置（设备认领已保留）。注意：导入开关已全部关闭，"
+                "再点开始导入会跳过所有相机。")
+        else:
+            self.status_label.setText("已恢复默认设置。")
 
     def append_log(self, text: str):
         self.log.append(text)
@@ -1654,7 +1671,7 @@ class ConfigWindow(QWidget):
             names = "、".join(f"{c['name']}[{c['serial']}]" for c in self.device_config)
             self.append_log(f"[INFO] 模式: 多设备分流（已认领 {len(self.device_config)} 台: {names}）")
             self.append_log(f"[INFO] 归档根目录: {import_path}")
-            self.append_log("[INFO] 未勾选/未认领的相机按机器名归入归档根目录，不会混进主库")
+            self.append_log("[INFO] 未勾选「导入此设备的照片」/未认领的相机本次跳过，不会导入")
         else:
             self.append_log("[INFO] 模式: 全量导入（还没认领任何设备）")
             self.append_log(f"[INFO] 目标目录: {import_path}")
@@ -1735,7 +1752,7 @@ class ConfigWindow(QWidget):
             cfg = cfg_by_serial.get(s)
             det = self._detected.get(s)
             if cfg:
-                mark = "（独立路径）" if cfg.get("enabled") else "（归档根目录）"
+                mark = "（导入）" if cfg.get("enabled") else "（跳过）"
                 label = f"{cfg['name']} · {s}{mark}"
             else:
                 model = (det or {}).get("model") or "未知机型"
@@ -1815,7 +1832,7 @@ class ConfigWindow(QWidget):
         self._refresh_device_combo(keep_serial=serial)
 
     def _on_dev_field_edited(self):
-        """设备名 / 独立路径改完后写回内存配置。"""
+        """设备名 / 导入路径改完后写回内存配置。"""
         if self._loading:
             return
         serial = self.combo_device.currentData()
@@ -1830,7 +1847,7 @@ class ConfigWindow(QWidget):
         self._refresh_device_combo(keep_serial=serial)
 
     def forget_device(self):
-        """从配置里移除当前设备，之后按「未认领」处理（按机型建目录）。"""
+        """从配置里移除当前设备，之后按「未认领」处理（本次跳过，不导入）。"""
         serial = self.combo_device.currentData()
         cfg = self._cfg_for(serial)
         if cfg is None:
@@ -1838,7 +1855,7 @@ class ConfigWindow(QWidget):
         if QMessageBox.question(
             self, "移除设备",
             f"要从配置中移除「{cfg['name']}」（序列号 {serial}）吗？\n"
-            "移除后它的照片会按机型自动建目录，可随时重新扫描认领。",
+            "移除后它的照片本次会跳过，可随时重新扫描认领。",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No
         ) != QMessageBox.Yes:
             return

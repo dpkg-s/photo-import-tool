@@ -97,9 +97,9 @@ def main():
     print("4. 落盘根目录解析 device_root_for")
     print("=" * 68)
     main_path = Path(r"D:\Lib")
-    check("有独立路径 → 用它",
+    check("有专属路径 → 用它",
           pit.device_root_for({"name": "A", "path": r"E:\A"}, main_path) == Path(r"E:\A"))
-    check("无独立路径 → 归档根目录\\设备名",
+    check("无专属路径 → 归档根目录\\设备名",
           pit.device_root_for({"name": "D800E", "path": ""}, main_path) == main_path / "D800E")
     check("路径空白视为未填",
           pit.device_root_for({"name": "A", "path": "   "}, main_path) == main_path / "A")
@@ -127,18 +127,18 @@ def main():
 
         print()
         print("=" * 68)
-        print("6. 分流：独立路径 + 未勾选 + 无序列号")
+        print("6. 分流：勾选进专属路径；未勾选/未认领跳过；无序列号放行")
         print("=" * 68)
         out = tmp / "out"
         out.mkdir()
-        own = tmp / "own_d800e"          # 本机的独立路径
+        own = tmp / "own_d800e"          # 本机的专属路径
         config = [
             {"serial": "9004185", "name": "D800E", "enabled": True, "path": str(own)},
             {"serial": "8105412", "name": "Z-6_2", "enabled": False, "path": ""},
         ]
         run_split(out, config, stats, card)
 
-        print(f"  本机独立路径 {own}:")
+        print(f"  本机专属路径 {own}:")
         for p in sorted(own.rglob("*")):
             if p.is_file():
                 print(f"    {p.relative_to(own)}")
@@ -150,20 +150,24 @@ def main():
         own_files = [str(p.relative_to(own)) for p in sorted(own.rglob("*")) if p.is_file()]
         joined_own = "\n".join(own_files)
         joined_arch = "\n".join(arch)
+        noser_dir = pit.device_dir_name(None, stats[pit.UNKNOWN_DEVICE])
 
-        check("本机照片进独立路径", len(own_files) == 2, str(len(own_files)))
+        check("本机照片进专属路径", len(own_files) == 2, str(len(own_files)))
         check("本机路径含 raw/jpg 分层", "\\raw\\" in joined_own and "\\jpg\\" in joined_own)
         check("本机路径不含设备名子目录", "D800E" not in joined_own)
-        check("未勾选设备按机器名建目录（不再有 _他机）",
-              "Z-6_2" in joined_arch and "_他机" not in joined_arch)
-        check("无序列号按机型建目录（不再有 _未识别）",
-              "_未识别" not in joined_arch and "D800E" in joined_arch)
-        check("归档根目录 3 个文件", len(arch) == 3, str(len(arch)))
         check("他机文件未混入本机路径", not any("DSC_" in f for f in own_files))
+        check("未勾选的 Z-6_2 本次跳过（一张没导）",
+              "Z-6_2" not in joined_arch and not any("DSC_" in f for f in arch))
+        check("未勾选也不建目录（没有 Z-6_2 目录）", not (out / "Z-6_2").exists())
+        check("不再有 _他机 目录", "_他机" not in joined_arch)
+        check(f"无序列号按机型放行 → {noser_dir}",
+              any(f.startswith(noser_dir) for f in arch))
+        check("归档根目录只有无序列号那 1 个文件", len(arch) == 1, str(len(arch)))
+        check("不再有 _未识别 残留", "_未识别" not in joined_arch)
 
         print()
         print("=" * 68)
-        print("7. 分流：设备未填路径 → 归档根目录\\设备名")
+        print("7. 分流：设备勾选但未填路径 → 归档根目录\\设备名")
         print("=" * 68)
         out2 = tmp / "out2"
         out2.mkdir()
@@ -173,11 +177,12 @@ def main():
         for f in f2:
             print(f"    {f}")
         joined2 = "\n".join(f2)
-        check("落到 归档根目录\\D800E", any("D800E" in f for f in f2))
-        check("未认领设备按机器名建目录", "Z-6_2" in joined2)
+        check("落到 归档根目录\\D800E", any(f.startswith("D800E") for f in f2))
+        check("未认领的 Z-6_2 跳过（不建目录）",
+              "Z-6_2" not in joined2 and not (out2 / "Z-6_2").exists())
         check("无 _他机 / _未识别 残留",
               "_他机" not in joined2 and "_未识别" not in joined2)
-        check("共 5 个文件", len(f2) == 5, str(len(f2)))
+        check("共 3 个文件（本机 2 + 无序列号 1）", len(f2) == 3, str(len(f2)))
 
         print()
         print("=" * 68)
@@ -194,7 +199,7 @@ def main():
 
         print()
         print("=" * 68)
-        print("9. 已认领但未勾选 → 仍走分流（按机器名，不再回落全量）")
+        print("9. 已认领但一台都没勾选 → 全跳过，且不回落全量")
         print("=" * 68)
         out4 = tmp / "out4"
         out4.mkdir()
@@ -204,9 +209,10 @@ def main():
         for f in f4:
             print(f"    {f}")
         joined4 = "\n".join(f4)
-        check("未勾选也走分流（5 个文件）", len(f4) == 5, str(len(f4)))
-        check("未勾选的 D800E 落 归档根目录\\D800E", "D800E" in joined4)
-        check("未认领的 Z-6_2 落 归档根目录\\Z-6_2", "Z-6_2" in joined4)
+        check("未勾选 → 本机/他机都不导（只剩无序列号 1 张）", len(f4) == 1, str(len(f4)))
+        check("没有回落成全量导入（全量会是 5 张）", len(f4) != 5)
+        check("未勾选的 D800E 一张没导", not any("XYL_4880" in f for f in f4))
+        check("未认领的 Z-6_2 一张没导", "Z-6_2" not in joined4)
 
         print()
         print("=" * 68)
@@ -284,7 +290,7 @@ def main():
 
         print()
         print("=" * 68)
-        print("12. 目录名推断：未勾选/未认领的机器怎么命名")
+        print("12. 目录名推断：无序列号放行目录 / 跳过时的日志标签")
         print("=" * 68)
         check("NIKON D800E → D800E",
               pit.suggest_device_name("NIKON D800E", "9004185") == "D800E")
