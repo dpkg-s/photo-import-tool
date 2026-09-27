@@ -31,124 +31,182 @@ def check(name, cond, detail=""):
     print(f"  [{mark}] {name}" + (f"  ({detail})" if detail else ""))
 
 
+def run_split(out, config, stats, card, use_run=False):
+    """在屏蔽盘符探测的前提下跑一次分流。"""
+    worker = pit.ImportWorker(out, "YYYY/MMDD", "测试", set(),
+                              device_config=config, scanned=stats)
+    real = pit.find_dcim_devices
+    pit.find_dcim_devices = lambda excluded: [card]
+    try:
+        worker._run() if use_run else worker._run_split()
+    finally:
+        pit.find_dcim_devices = real
+
+
 def main():
     missing = [k for k, p in FIXTURES.items() if not p.exists()]
     if missing:
         print(f"夹具缺失: {missing}")
         return 1
 
-    print("=" * 66)
+    print("=" * 68)
     print("1. 序列号读取")
-    print("=" * 66)
+    print("=" * 68)
     sn = {k: pit.read_body_serial(p) for k, p in FIXTURES.items()}
-    check("本机 JPG 序列号 = 9004185", sn["mine_jpg"] == "9004185", sn["mine_jpg"])
-    check("本机 NEF 序列号 = 9004185", sn["mine_nef"] == "9004185", sn["mine_nef"])
-    check("他机 NEF 序列号 = 8105412", sn["other_nef"] == "8105412", sn["other_nef"])
-    check("他机 JPG 序列号 = 8105412", sn["other_jpg"] == "8105412", sn["other_jpg"])
-    check("无序列号图返回 None（安全模式）", sn["noser"] is None, repr(sn["noser"]))
+    check("本机 JPG = 9004185", sn["mine_jpg"] == "9004185", str(sn["mine_jpg"]))
+    check("本机 NEF = 9004185", sn["mine_nef"] == "9004185", str(sn["mine_nef"]))
+    check("他机 NEF = 8105412", sn["other_nef"] == "8105412", str(sn["other_nef"]))
+    check("他机 JPG = 8105412", sn["other_jpg"] == "8105412", str(sn["other_jpg"]))
+    check("无序列号返回 None（安全模式）", sn["noser"] is None, repr(sn["noser"]))
 
     print()
-    print("=" * 66)
-    print("2. 设备名清理（防路径注入 / 非法字符）")
-    print("=" * 66)
+    print("=" * 68)
+    print("2. 设备名清理（防路径注入）")
+    print("=" * 68)
     check("剥离路径分隔符", pit.sanitize_device_name("a/b\\c") == "a_b_c")
-    check("剥离冒号等非法字符", pit.sanitize_device_name('a:b*c?d"e') == "a_b_c_d_e")
+    check("剥离非法字符", pit.sanitize_device_name('a:b*c?d"e') == "a_b_c_d_e")
     check("剥离首尾点号", pit.sanitize_device_name("...cam...") == "cam")
     check("空名返回空", pit.sanitize_device_name("   ") == "")
 
     print()
-    print("=" * 66)
-    print("3. 白名单序列化往返")
-    print("=" * 66)
-    m = {"9004185": "D800E", "1234567": "Z6II"}
-    text = pit.format_device_map(m)
-    check("序列化后再解析一致", pit.parse_device_map(text) == m, text)
-    check("空串解析为空字典", pit.parse_device_map("") == {})
-    check("垃圾串被忽略", pit.parse_device_map(";;garbage;=noname;999=ok") == {"999": "ok"})
-    check("拒绝 UNKNOWN 键", pit.parse_device_map("UNKNOWN=x") == {})
+    print("=" * 68)
+    print("3. 设备配置 JSON 往返")
+    print("=" * 68)
+    cfg = [
+        {"serial": "9004185", "name": "D800E", "enabled": True, "path": r"D:\D800E"},
+        {"serial": "8105412", "name": "Z-6_2", "enabled": False, "path": ""},
+    ]
+    text = pit.format_device_config(cfg)
+    check("往返一致", pit.parse_device_config(text) == cfg, text[:44])
+    check("损坏 JSON → 空列表", pit.parse_device_config("{not json") == [])
+    check("非列表 → 空列表", pit.parse_device_config('{"a":1}') == [])
+    check("空串 → 空列表", pit.parse_device_config("") == [])
+    check("拒绝 UNKNOWN 序列号",
+          pit.parse_device_config('[{"serial":"UNKNOWN","name":"x"}]') == [])
+    check("重复序列号只留首个", len(pit.parse_device_config(
+        '[{"serial":"1","name":"a"},{"serial":"1","name":"b"}]')) == 1)
+    check("缺 enabled 默认关闭",
+          pit.parse_device_config('[{"serial":"1","name":"a"}]')[0]["enabled"] is False)
+    check("name 非法字符被清理",
+          pit.parse_device_config('[{"serial":"1","name":"a/b"}]')[0]["name"] == "a_b")
+    check("名字为空时回退成序列号",
+          pit.parse_device_config('[{"serial":"777","name":"  "}]')[0]["name"] == "777")
 
     print()
-    print("=" * 66)
-    print("4. 端到端分流拷贝")
-    print("=" * 66)
+    print("=" * 68)
+    print("4. 落盘根目录解析 device_root_for")
+    print("=" * 68)
+    main_path = Path(r"D:\Lib")
+    check("有独立路径 → 用它",
+          pit.device_root_for({"name": "A", "path": r"E:\A"}, main_path) == Path(r"E:\A"))
+    check("无独立路径 → 归档根目录\\设备名",
+          pit.device_root_for({"name": "D800E", "path": ""}, main_path) == main_path / "D800E")
+    check("路径空白视为未填",
+          pit.device_root_for({"name": "A", "path": "   "}, main_path) == main_path / "A")
 
     tmp = Path(tempfile.mkdtemp(prefix="split_verify_"))
     try:
-        # 构造一个假卡：DCIM/100TEST/ 下放 5 个真实夹具
+        # 构造假卡：DCIM/100TEST/ 下放 5 个真实夹具
         card = tmp / "card"
         dcim = card / pit.DCIM_NAME / "100TEST"
         dcim.mkdir(parents=True)
         for key, src in FIXTURES.items():
             shutil.copy2(src, dcim / src.name)
 
-        out = tmp / "out"
-        out.mkdir()
-
+        print()
+        print("=" * 68)
+        print("5. 扫描分组")
+        print("=" * 68)
         stats = pit.scan_devices([card])
-        print(f"  扫描到 {len(stats)} 台设备:")
-        for s, e in stats.items():
+        for s, e in sorted(stats.items(), key=lambda kv: -kv[1]["count"]):
             print(f"    {s}: {e['count']} 张, 机型={e['model']!r}")
         check("扫出 3 组（本机/他机/未识别）", len(stats) == 3, str(list(stats)))
         check("本机组 2 张", stats.get("9004185", {}).get("count") == 2)
         check("他机组 2 张", stats.get("8105412", {}).get("count") == 2)
         check("未识别组 1 张", stats.get(pit.UNKNOWN_DEVICE, {}).get("count") == 1)
 
-        worker = pit.ImportWorker(
-            out, "YYYY/MMDD", "测试", set(),
-            device_map={"9004185": "D800E"},
-            scanned=stats,
-        )
-        real_find = pit.find_dcim_devices
-        pit.find_dcim_devices = lambda excluded: [card]
-        try:
-            worker._run_split()                   # 直接跑核心逻辑，不触发 Qt 信号
-        finally:
-            pit.find_dcim_devices = real_find
+        print()
+        print("=" * 68)
+        print("6. 分流：独立路径 + 未勾选 + 无序列号")
+        print("=" * 68)
+        out = tmp / "out"
+        out.mkdir()
+        own = tmp / "own_d800e"          # 本机的独立路径
+        config = [
+            {"serial": "9004185", "name": "D800E", "enabled": True, "path": str(own)},
+            {"serial": "8105412", "name": "Z-6_2", "enabled": False, "path": ""},
+        ]
+        run_split(out, config, stats, card)
 
-        print(f"  目标树 ({out}):")
-        found = []
-        for p in sorted(out.rglob("*")):
+        print(f"  本机独立路径 {own}:")
+        for p in sorted(own.rglob("*")):
             if p.is_file():
-                rel = p.relative_to(out)
-                found.append(str(rel))
-                print(f"    {rel}")
+                print(f"    {p.relative_to(own)}")
+        print(f"  归档根目录 {out}:")
+        arch = [str(p.relative_to(out)) for p in sorted(out.rglob("*")) if p.is_file()]
+        for f in arch:
+            print(f"    {f}")
 
-        joined = "\n".join(found)
-        check("本机照片进 D800E/", "D800E" in joined)
-        check("他机照片进 _他机/8105412/", "_他机" in joined and "8105412" in joined)
-        check("未识别照片进 _未识别/", "_未识别" in joined)
-        check("保留 raw/jpg 分层", "\\raw\\" in joined and "\\jpg\\" in joined)
-        check("他机文件未混入本机目录",
-              not any("D800E" in f and "DSC_" in f for f in found))
-        check("共计 5 个文件落盘", len(found) == 5, str(len(found)))
+        own_files = [str(p.relative_to(own)) for p in sorted(own.rglob("*")) if p.is_file()]
+        joined_own = "\n".join(own_files)
+        joined_arch = "\n".join(arch)
+
+        check("本机照片进独立路径", len(own_files) == 2, str(len(own_files)))
+        check("本机路径含 raw/jpg 分层", "\\raw\\" in joined_own and "\\jpg\\" in joined_own)
+        check("本机路径不含设备名子目录", "D800E" not in joined_own)
+        check("未勾选设备进 _他机\\8105412",
+              "_他机" in joined_arch and "8105412" in joined_arch)
+        check("无序列号进 _未识别", "_未识别" in joined_arch)
+        check("归档根目录只有他机与未识别", len(arch) == 3, str(len(arch)))
+        check("他机文件未混入本机路径", not any("DSC_" in f for f in own_files))
 
         print()
-        print("=" * 66)
-        print("5. 向后兼容：device_map 为空时走全量模式")
-        print("=" * 66)
+        print("=" * 68)
+        print("7. 分流：设备未填路径 → 归档根目录\\设备名")
+        print("=" * 68)
         out2 = tmp / "out2"
         out2.mkdir()
-        # 屏蔽盘符探测：本机 Y:/Z: 是失效网络盘，探测会挂起 28s
-        real_find = pit.find_dcim_devices
-        pit.find_dcim_devices = lambda excluded: [card]
-        try:
-            w2 = pit.ImportWorker(out2, "YYYY/MMDD", "测试", set(), scanned=stats)
-            w2._run_flat()
-        finally:
-            pit.find_dcim_devices = real_find
-        found2 = [str(p.relative_to(out2)) for p in sorted(out2.rglob("*")) if p.is_file()]
-        check("全量模式落盘 5 个文件", len(found2) == 5, str(len(found2)))
-        check("全量模式无设备分层",
-              not any("D800E" in f or "_他机" in f for f in found2))
-        check("全量模式结构为 日期/raw|jpg",
-              all(("\\raw\\" in f or "\\jpg\\" in f) for f in found2))
+        config2 = [{"serial": "9004185", "name": "D800E", "enabled": True, "path": ""}]
+        run_split(out2, config2, stats, card)
+        f2 = [str(p.relative_to(out2)) for p in sorted(out2.rglob("*")) if p.is_file()]
+        for f in f2:
+            print(f"    {f}")
+        joined2 = "\n".join(f2)
+        check("落到 归档根目录\\D800E", any("D800E" in f for f in f2))
+        check("未勾选的他机仍进 _他机", "_他机" in joined2)
+        check("未识别仍进 _未识别", "_未识别" in joined2)
+        check("共 5 个文件", len(f2) == 5, str(len(f2)))
+
+        print()
+        print("=" * 68)
+        print("8. 未启用任何设备 → 回落全量模式")
+        print("=" * 68)
+        out3 = tmp / "out3"
+        out3.mkdir()
+        run_split(out3, [], stats, card, use_run=True)
+        f3 = [str(p.relative_to(out3)) for p in sorted(out3.rglob("*")) if p.is_file()]
+        check("全量模式 5 个文件", len(f3) == 5, str(len(f3)))
+        check("无设备分层，直接 日期/raw|jpg",
+              all(("\\raw\\" in f or "\\jpg\\" in f) for f in f3)
+              and not any("D800E" in f or "_他机" in f for f in f3))
+
+        print()
+        print("=" * 68)
+        print("9. 设备存在但全部关闭 → 同样回落全量")
+        print("=" * 68)
+        out4 = tmp / "out4"
+        out4.mkdir()
+        run_split(out4, [{"serial": "9004185", "name": "D800E",
+                          "enabled": False, "path": ""}], stats, card, use_run=True)
+        f4 = [str(p.relative_to(out4)) for p in sorted(out4.rglob("*")) if p.is_file()]
+        check("全关时走全量（5 个文件）", len(f4) == 5, str(len(f4)))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
     print()
-    print("=" * 66)
+    print("=" * 68)
     print(f"结果：{len(PASS)} 通过 / {len(FAIL)} 失败")
-    print("=" * 66)
+    print("=" * 68)
     if FAIL:
         print("失败项:")
         for f in FAIL:

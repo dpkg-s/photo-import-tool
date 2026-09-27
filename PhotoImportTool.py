@@ -18,6 +18,7 @@
 
 import sys
 import os
+import json
 import shutil
 from pathlib import Path
 from datetime import datetime
@@ -30,9 +31,9 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QCheckBox, QGroupBox, QTextEdit, QProgressBar,
     QFileDialog, QMessageBox, QFrame, QGridLayout, QSplitter, QRadioButton,
-    QDialog, QTableWidget, QTableWidgetItem, QHeaderView
+    QScrollArea, QSizePolicy
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QObject, QThread
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QThread, QTimer
 from PyQt5.QtGui import QPalette, QColor, QFont
 
 from PIL import Image
@@ -118,7 +119,7 @@ class RegistryConfig:
             "open_scope": "all",
             "open_types": "raw,jpg",
             "remark": "",
-            "device_map": "",
+            "device_config": "[]",
         }
         try:
             with self._open(False) as key:
@@ -126,6 +127,19 @@ class RegistryConfig:
                     try:
                         value, _ = winreg.QueryValueEx(key, name)
                         defaults[name] = value
+                    except FileNotFoundError:
+                        pass
+                # 兼容 v5 早期版本：那时设备白名单存成 "序列号=设备名;..."
+                if defaults.get("device_config", "[]") in ("", "[]"):
+                    try:
+                        legacy, _ = winreg.QueryValueEx(key, "device_map")
+                        if legacy:
+                            migrated = [
+                                {"serial": s, "name": n, "enabled": True, "path": ""}
+                                for s, n in parse_device_map_legacy(legacy).items()
+                            ]
+                            if migrated:
+                                defaults["device_config"] = format_device_config(migrated)
                     except FileNotFoundError:
                         pass
         except FileNotFoundError:
@@ -138,7 +152,6 @@ class RegistryConfig:
                 winreg.SetValueEx(key, name, 0, winreg.REG_SZ, str(value))
 
 
-# 设备白名单序列化：``序列号=设备名;序列号=设备名``。
 # 设备名会参与路径拼接，故必须过滤 Windows 非法字符，避免建目录失败。
 _ILLEGAL_NAME_CHARS = '<>:"/\\|?*'
 
@@ -150,8 +163,44 @@ def sanitize_device_name(name: str) -> str:
     return cleaned
 
 
-def parse_device_map(text: str) -> dict[str, str]:
-    """解析注册表中的设备白名单，返回 {序列号: 设备名}。"""
+def parse_device_config(text: str) -> list[dict]:
+    """解析设备配置 JSON。
+
+    返回 ``[{"serial","name","enabled","path"}, ...]``。
+    损坏 / 非列表的输入一律当作空配置，避免把配置错误升级成导入事故。
+    """
+    try:
+        raw = json.loads(text or "[]")
+    except Exception:
+        return []
+    if not isinstance(raw, list):
+        return []
+
+    result: list[dict] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        serial = str(item.get("serial", "")).strip()
+        if not serial or serial == UNKNOWN_DEVICE or serial in seen:
+            continue
+        seen.add(serial)
+        result.append({
+            "serial": serial,
+            "name": sanitize_device_name(item.get("name", "")) or serial,
+            "enabled": bool(item.get("enabled", False)),
+            "path": str(item.get("path", "")).strip(),
+        })
+    return result
+
+
+def format_device_config(config: list[dict]) -> str:
+    """把设备配置序列化为注册表用的 JSON 字符串。"""
+    return json.dumps(config, ensure_ascii=False)
+
+
+def parse_device_map_legacy(text: str) -> dict[str, str]:
+    """解析 v5 早期的 ``序列号=设备名;...`` 旧格式，仅用于升级迁移。"""
     result: dict[str, str] = {}
     for chunk in str(text or "").split(";"):
         chunk = chunk.strip()
@@ -160,14 +209,21 @@ def parse_device_map(text: str) -> dict[str, str]:
         serial, _, name = chunk.partition("=")
         serial = serial.strip()
         name = sanitize_device_name(name)
-        if serial and name and serial != UNKNOWN_DEVICE:
+        if serial and name:
             result[serial] = name
     return result
 
 
-def format_device_map(mapping: dict[str, str]) -> str:
-    """把 {序列号: 设备名} 序列化回注册表字符串。"""
-    return ";".join(f"{s}={n}" for s, n in mapping.items())
+def device_root_for(cfg: dict, main_path: Path) -> Path:
+    """算出某台设备的落盘根目录。
+
+    配了独立路径就用它（适合每台相机一个独立库）；否则退到
+    ``主导入路径/设备名``，与其他设备并列但不混装。
+    """
+    own = str(cfg.get("path", "")).strip()
+    if own:
+        return Path(own)
+    return main_path / sanitize_device_name(cfg.get("name", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -468,7 +524,7 @@ class ImportWorker(QThread):
     """后台执行导入工作。"""
 
     def __init__(self, import_path: Path, date_format: str, remark: str,
-                 excluded_drives: set[str], device_map: dict[str, str] | None = None,
+                 excluded_drives: set[str], device_config: list[dict] | None = None,
                  scanned: dict | None = None):
         super().__init__()
         self.signals = ImportSignals()
@@ -476,9 +532,10 @@ class ImportWorker(QThread):
         self.date_format = date_format
         self.remark = remark.strip()
         self.excluded_drives = excluded_drives
-        # device_map: 已认领的机身序列号 -> 设备名；为空时退化为原有全量导入行为
-        self.device_map = device_map or {}
-        # scanned: 已扫描结果，复用以避免二次读卡（分流模式下由 ScanWorker 提供）
+        # device_config: 设备配置列表，每项 {serial,name,enabled,path}。
+        # 没有任何「已启用」设备时退化为全量导入，与历史版本行为一致。
+        self.device_config = device_config or []
+        # scanned: 已扫描结果，复用以避免二次读卡
         self.scanned = scanned
         self._abort = False
         self._result = defaultdict(int)
@@ -524,7 +581,8 @@ class ImportWorker(QThread):
             self.signals.finished.emit(dict(self._result))
 
     def _run(self):
-        if self.device_map:
+        # 有任意一台设备被勾选 → 走分流；否则保持历史的全量行为不变
+        if any(c.get("enabled") for c in self.device_config):
             self._run_split()
         else:
             self._run_flat()
@@ -536,12 +594,12 @@ class ImportWorker(QThread):
         return scan_devices(devices, log=self._log)
 
     def _run_split(self):
-        """多设备分流导入：按机身序列号决定落盘目录。
+        """按设备配置分流导入。
 
-        落盘规则：
-          - 已认领设备 → ``<导入路径>/<设备名>/<日期目录>/<raw|jpg>``
-          - 未认领设备 → ``<导入路径>/_他机/<设备名或序列号>/<日期目录>/<raw|jpg>``
-          - 读不到序列号 → 走安全模式，按主目录落盘（宁可多导，不漏片）
+        落盘根目录（base）后固定接 ``<日期目录>/<raw|jpg>``：
+          - 已启用设备 → 该设备自己的路径（留空则 ``<主导入路径>/<设备名>``）
+          - 未勾选的设备 → ``<主导入路径>/_他机/<序列号>``（不混进主库，但也不丢）
+          - 读不到序列号 → ``<主导入路径>/_未识别``（安全模式，宁可多导）
         """
         self._log("")
         self._log("[步骤 1/4] 检测移动硬盘...")
@@ -553,45 +611,62 @@ class ImportWorker(QThread):
             self._log(f"         - {dev}")
 
         self._log("")
-        self._log("[步骤 2/4] 按机身序列号分流...")
+        self._log("[步骤 2/4] 按设备配置分流...")
         stats = self._scan(devices)
 
-        groups = []          # [(输出前缀 Path, 设备标签, [文件...])]
-        claimed_total = 0
-        unclaimed_total = 0
+        cfg_by_serial = {c["serial"]: c for c in self.device_config}
+        enabled_count = sum(1 for c in self.device_config if c.get("enabled"))
+
+        groups = []          # [(落盘根 Path, 设备标签, [文件...])]
+        mine_total = 0
+        other_total = 0
         unknown_total = 0
 
         for serial, entry in sorted(stats.items(), key=lambda kv: -kv[1]["count"]):
             files = entry["files"]
-            if serial == UNKNOWN_DEVICE:
-                unknown_total = entry["count"]
-                label = "未识别"
-                prefix = Path("_未识别")
-            elif serial in self.device_map:
-                claimed_total += entry["count"]
-                label = self.device_map[serial]
-                prefix = Path(sanitize_device_name(label))
-            else:
-                unclaimed_total += entry["count"]
-                label = f"{entry['model'] or '未知机型'} [{serial}]"
-                prefix = Path("_他机") / sanitize_device_name(serial)
-
+            cfg = cfg_by_serial.get(serial)
             span = ""
             if entry["dmin"]:
                 span = f"，{entry['dmin']:%Y-%m-%d} ~ {entry['dmax']:%Y-%m-%d}"
-            self._log(
-                f"         {label}: {entry['count']} 张 "
-                f"(RAW {entry['raw']} / JPG {entry['jpg']}){span}"
-            )
-            self._log(f"            → {self.import_path / prefix}")
-            groups.append((prefix, label, files))
+            detail = (f"{entry['count']} 张 "
+                      f"(RAW {entry['raw']} / JPG {entry['jpg']}){span}")
+
+            if serial == UNKNOWN_DEVICE:
+                unknown_total += entry["count"]
+                label = "未识别"
+                base = self.import_path / "_未识别"
+                self._log(f"         {label}: {detail}")
+                self._log("            └ 无序列号，按安全模式放行（宁可多导，不漏片）")
+            elif cfg and cfg.get("enabled"):
+                mine_total += entry["count"]
+                label = cfg["name"]
+                base = device_root_for(cfg, self.import_path)
+                self._log(f"         {label}: {detail}")
+            elif cfg:
+                other_total += entry["count"]
+                label = f"{cfg['name']} [{serial}]"
+                base = self.import_path / "_他机" / sanitize_device_name(serial)
+                self._log(f"         {label}: {detail}")
+                self._log("            └ 未勾选「导入此设备的照片」，归入 _他机")
+            else:
+                other_total += entry["count"]
+                label = f"{entry['model'] or '未知机型'} [{serial}]"
+                base = self.import_path / "_他机" / sanitize_device_name(serial)
+                self._log(f"         {label}: {detail}")
+                self._log("            └ 未配置设备，归入 _他机")
+
+            self._log(f"            → {base}")
+            groups.append((base, label, files))
 
         if unknown_total:
-            self._log(f"[INFO] 其中 {unknown_total} 张无法读取序列号，已按安全模式归入 _未识别")
-        if unclaimed_total:
-            self._log(f"[INFO] 其中 {unclaimed_total} 张属于未认领设备，已归入 _他机")
+            self._log(f"[INFO] {unknown_total} 张读不到序列号，按安全模式归入 _未识别")
+        if other_total:
+            self._log(f"[INFO] {other_total} 张不属于已启用设备，归入 _他机（未丢弃）")
+        if mine_total == 0:
+            self._log("[WARNING] 本次没有命中任何已启用设备")
+            self._log("         如需导入自己的照片，请在「多设备分流」里勾选对应相机")
 
-        total = sum(len(f) for _, _, f in groups)
+        total = sum(len(files) for _, _, files in groups)
         if total == 0:
             self._log("[WARNING] 未找到照片文件")
             return
@@ -599,15 +674,15 @@ class ImportWorker(QThread):
         # 步骤 3: 导入
         self._log("")
         self._log("[步骤 3/4] 开始导入...")
-        self._log(f"[INFO] 目标根目录: {self.import_path}")
+        self._log(f"[INFO] 分流模式:   多设备（已启用 {enabled_count} 台）")
+        self._log(f"[INFO] 日期格式:   {self.date_format}")
         if self.remark:
             self._log(f"[INFO] 备注:       {self.remark}")
-        self._log(f"[INFO] 分流模式:   多设备（已认领 {len(self.device_map)} 台）")
         self._log("─" * 64)
 
         processed = 0
-        for prefix, label, files in groups:
-            processed = self._copy_group(label, files, prefix, processed, total)
+        for base, label, files in groups:
+            processed = self._copy_group(label, files, base, processed, total)
             if self._abort:
                 return
 
@@ -655,21 +730,21 @@ class ImportWorker(QThread):
         self._log("─" * 64)
 
         processed = 0
-        processed = self._copy_group("RAW", raw_files, Path("."), processed, total)
+        processed = self._copy_group("RAW", raw_files, self.import_path, processed, total)
         if self._abort:
             return
-        processed = self._copy_group("JPG", jpg_files, Path("."), processed, total)
+        processed = self._copy_group("JPG", jpg_files, self.import_path, processed, total)
         if self._abort:
             return
 
         self._finish(total)
 
-    def _copy_group(self, label: str, files: list[Path], prefix: Path,
+    def _copy_group(self, label: str, files: list[Path], base: Path,
                     processed: int, total: int) -> int:
-        """拷贝一组文件到 ``<导入路径>/<prefix>/<日期目录>/<raw|jpg>``。
+        """拷贝一组文件到 ``<base>/<日期目录>/<raw|jpg>``。
 
-        prefix 为空（Path('.')）时退化为 ``<日期目录>/<raw|jpg>``，
-        与原版全量导入的目录结构完全一致。
+        base 是绝对落盘根目录：全量模式下即主导入路径；分流模式下为
+        各设备自己的路径，或 _他机/_未识别 目录。raw/jpg 分层由本方法统一补上。
         """
         self._log(f"[{label}] 共 {len(files)} 个文件")
         for src in files:
@@ -679,8 +754,7 @@ class ImportWorker(QThread):
 
             dt = get_file_date(src)
             subdir = "raw" if src.suffix.lower() in RAW_EXTS else "jpg"
-            rel_dir = prefix / self._format_date_dir(dt) / subdir
-            dst_dir = self.import_path / rel_dir
+            dst_dir = base / self._format_date_dir(dt) / subdir
             dst = dst_dir / src.name
 
             if not dst_dir.exists():
@@ -742,183 +816,25 @@ class ImportWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
-# 设备认领对话框
-# ---------------------------------------------------------------------------
-class DeviceDialog(QDialog):
-    """展示卡内检测到的设备，由主人勾选认领并命名。
-
-    认领的设备按所填设备名分流入库；未认领的归入 ``_他机/<序列号>``，
-    读不到序列号的归入 ``_未识别``（安全模式，不漏片）。
-    """
-
-    def __init__(self, stats: dict, device_map: dict, import_path: Path, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("多设备分流 - 认领相机")
-        self.setMinimumWidth(760)
-        self.stats = stats
-        self.device_map = device_map
-        self.import_path = import_path
-        self.result_map: dict[str, str] = {}
-        self._rows = []
-        self._build_ui()
-
-    def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setSpacing(10)
-        layout.setContentsMargins(16, 16, 16, 16)
-
-        tip = QLabel(
-            "检测到以下设备。勾选属于你自己的相机并填写设备名，\n"
-            "已认领的照片将导入「设备名/日期/raw|jpg」，未认领的归入「_他机」。"
-        )
-        tip.setStyleSheet("color: #444; line-height: 160%;")
-        layout.addWidget(tip)
-
-        self.table = QTableWidget()
-        self.table.setColumnCount(6)
-        self.table.setHorizontalHeaderLabels(
-            ["认领", "序列号", "机型", "张数", "拍摄时间", "导入到（设备名）"]
-        )
-        self.table.verticalHeader().setVisible(False)
-        self.table.setSelectionMode(QTableWidget.NoSelection)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-
-        entries = sorted(self.stats.items(), key=lambda kv: -kv[1]["count"])
-        self.table.setRowCount(len(entries))
-
-        for row, (serial, entry) in enumerate(entries):
-            known = serial != UNKNOWN_DEVICE
-            claimed = known and serial in self.device_map
-
-            chk = QTableWidgetItem()
-            chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-            chk.setCheckState(Qt.Checked if claimed else Qt.Unchecked)
-            if not known:
-                chk.setFlags(Qt.NoItemFlags)   # 未识别设备不可认领
-            self.table.setItem(row, 0, chk)
-
-            self.table.setItem(row, 1, QTableWidgetItem(serial if known else "无法读取"))
-            self.table.setItem(row, 2, QTableWidgetItem(entry["model"] or "-"))
-            self.table.setItem(row, 3, QTableWidgetItem(
-                f"{entry['count']} (RAW {entry['raw']}/JPG {entry['jpg']})"))
-
-            span = "-"
-            if entry["dmin"]:
-                span = f"{entry['dmin']:%Y-%m-%d} ~ {entry['dmax']:%Y-%m-%d}"
-            self.table.setItem(row, 4, QTableWidgetItem(span))
-
-            name_edit = QLineEdit()
-            name_edit.setPlaceholderText("取消勾选则归入 _他机")
-            if claimed:
-                name_edit.setText(self.device_map[serial])
-            elif known:
-                # 用机型给出默认建议名，省去手输
-                name_edit.setText(self._suggest_name(entry["model"], serial))
-            else:
-                name_edit.setEnabled(False)
-                name_edit.setPlaceholderText("未识别设备，导入到 _未识别")
-                chk.setCheckState(Qt.Unchecked)
-            self.table.setCellWidget(row, 5, name_edit)
-            self._rows.append((row, serial, name_edit, chk))
-
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setColumnWidth(0, 50)
-        self.table.setColumnWidth(1, 110)
-        self.table.setColumnWidth(2, 130)
-        self.table.setColumnWidth(3, 120)
-        self.table.setColumnWidth(4, 180)
-        layout.addWidget(self.table)
-
-        hint = QLabel(f"导入根目录：{self.import_path}")
-        hint.setStyleSheet("color: #666; font-size: 12px;")
-        layout.addWidget(hint)
-
-        btn_row = QHBoxLayout()
-        self.btn_all = QPushButton("全部认领")
-        self.btn_all.clicked.connect(lambda: self._set_all(True))
-        self.btn_none = QPushButton("全不认领")
-        self.btn_none.clicked.connect(lambda: self._set_all(False))
-        btn_row.addWidget(self.btn_all)
-        btn_row.addWidget(self.btn_none)
-        btn_row.addStretch()
-
-        self.btn_ok = QPushButton("开始分流导入")
-        self.btn_ok.setStyleSheet("""
-            QPushButton {
-                background-color: #28a745; color: white; border: none;
-                border-radius: 4px; padding: 8px 22px; font-weight: bold;
-            }
-            QPushButton:hover { background-color: #218838; }
-        """)
-        self.btn_ok.clicked.connect(self._on_accept)
-        btn_cancel = QPushButton("取消")
-        btn_cancel.clicked.connect(self.reject)
-        btn_row.addWidget(btn_cancel)
-        btn_row.addWidget(self.btn_ok)
-        layout.addLayout(btn_row)
-
-    @staticmethod
-    def _suggest_name(model: str, serial: str) -> str:
-        """从机型名猜一个默认设备名（如 NIKON D800E -> D800E）。"""
-        if not model:
-            return f"相机{serial[-4:]}" if serial else "相机"
-        name = model.strip()
-        for prefix in ("NIKON ", "NIKON", "Canon ", "SONY ", "Sony "):
-            if name.upper().startswith(prefix.upper()):
-                name = name[len(prefix):]
-                break
-        # 机型里的空格（如 "Z 6_2"）不适合做目录名，压成短横
-        name = name.strip().replace(" ", "-")
-        return sanitize_device_name(name) or f"相机{serial[-4:]}"
-
-    def _set_all(self, checked: bool):
-        for _row, serial, _edit, chk in self._rows:
-            if serial == UNKNOWN_DEVICE:
-                continue
-            chk.setCheckState(Qt.Checked if checked else Qt.Unchecked)
-
-    def _on_accept(self):
-        mapping: dict[str, str] = {}
-        for _row, serial, edit, chk in self._rows:
-            if serial == UNKNOWN_DEVICE or chk.checkState() != Qt.Checked:
-                continue
-            name = sanitize_device_name(edit.text())
-            if not name:
-                QMessageBox.warning(
-                    self, "缺少设备名",
-                    f"序列号 {serial} 已勾选但未填写设备名。\n"
-                    "请填写设备名，或取消勾选使其归入 _他机。"
-                )
-                return
-            mapping[serial] = name
-
-        # 同名冲突会导致两台设备写进同一目录，提前拦下
-        seen: dict[str, str] = {}
-        for serial, name in mapping.items():
-            if name in seen:
-                QMessageBox.warning(
-                    self, "设备名重复",
-                    f"「{name}」被多台设备使用（{seen[name]} 与 {serial}）。\n"
-                    "请改成互不相同的设备名。"
-                )
-                return
-            seen[name] = serial
-
-        self.result_map = mapping
-        self.accept()
-
-
-# ---------------------------------------------------------------------------
 # 主配置窗口（日志集成在主窗口）
 # ---------------------------------------------------------------------------
 class ConfigWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
-        self.setMinimumSize(700, 780)
+        # 上半部分可滚动，最低高度可以放宽；默认给一个舒展的初始尺寸
+        self.setMinimumSize(780, 720)
+        self.resize(820, 1040)
 
         self.config = RegistryConfig()
         self.settings = self.config.load()
+
+        # 设备配置（每项 {serial,name,enabled,path}）与最近一次扫描结果。
+        # 必须在 _build_ui 之前就位：设备下拉框在构建期即会触发选中回调。
+        self.device_config = parse_device_config(self.settings.get("device_config", "[]"))
+        self._detected: dict = {}
+        self._loading = False      # 程序化填充控件时抑制回写
+        self._viewed_serial = None  # 上一次已滚动到视野的设备，避免重复跳转
 
         self._build_ui()
         self._load_settings()
@@ -926,9 +842,27 @@ class ConfigWindow(QWidget):
         self._worker = None
 
     def _build_ui(self):
-        main_layout = QVBoxLayout(self)
+        # 外层：上半部分可滚动（多设备面板展开后高度会变），日志区固定在底部
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setSpacing(12)
+        outer_layout.setContentsMargins(20, 16, 20, 16)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }\n"
+            "QScrollArea > QWidget > QWidget { background: transparent; }"
+        )
+
+        top_host = QWidget()
+        top_host.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        main_layout = QVBoxLayout(top_host)
         main_layout.setSpacing(12)
-        main_layout.setContentsMargins(20, 16, 20, 16)
+        main_layout.setContentsMargins(0, 0, 6, 0)
+        self.scroll.setWidget(top_host)
+        outer_layout.addWidget(self.scroll, 1)
 
         # 标题区
         title_layout = QVBoxLayout()
@@ -970,33 +904,21 @@ class ConfigWindow(QWidget):
         form.setSpacing(10)
         form.setColumnStretch(1, 1)
 
-        # 导入路径
-        form.addWidget(QLabel("导入路径:"), 0, 0)
-        path_layout = QHBoxLayout()
-        self.edit_path = QLineEdit()
-        self.edit_path.setPlaceholderText("照片要存放到哪里，例: E:\\本地资源库\\d800e")
-        self.btn_browse = QPushButton("浏览...")
-        self.btn_browse.setFixedWidth(70)
-        self.btn_browse.clicked.connect(self.choose_path)
-        path_layout.addWidget(self.edit_path)
-        path_layout.addWidget(self.btn_browse)
-        form.addLayout(path_layout, 0, 1)
-
         # 日期格式
-        form.addWidget(QLabel("日期格式:"), 1, 0)
+        form.addWidget(QLabel("日期格式:"), 0, 0)
         self.combo_date = QComboBox()
         self.combo_date.addItems(list(DATE_FORMATS.keys()))
         self.combo_date.setMinimumWidth(180)
-        form.addWidget(self.combo_date, 1, 1, alignment=Qt.AlignLeft)
+        form.addWidget(self.combo_date, 0, 1, alignment=Qt.AlignLeft)
 
         # 备注
-        form.addWidget(QLabel("备注:"), 2, 0)
+        form.addWidget(QLabel("备注:"), 1, 0)
         self.edit_remark = QLineEdit()
         self.edit_remark.setPlaceholderText("可选，如：旅行、婚礼；会追加到日期目录名后")
-        form.addWidget(self.edit_remark, 2, 1)
+        form.addWidget(self.edit_remark, 1, 1)
 
         # 排除盘符（使用网格流式布局，避免盘符过多时横向溢出；支持刷新）
-        form.addWidget(QLabel("排除盘符（不扫描）:"), 3, 0, alignment=Qt.AlignTop)
+        form.addWidget(QLabel("排除盘符（不扫描）:"), 2, 0, alignment=Qt.AlignTop)
         drive_container = QVBoxLayout()
         drive_container.setSpacing(6)
         drive_container.setContentsMargins(0, 0, 0, 0)
@@ -1015,7 +937,7 @@ class ConfigWindow(QWidget):
         self.btn_refresh.setStyleSheet("padding: 4px 8px; font-size: 12px;")
         self.btn_refresh.clicked.connect(self.refresh_drives)
         drive_container.addWidget(self.btn_refresh, alignment=Qt.AlignLeft)
-        form.addLayout(drive_container, 3, 1)
+        form.addLayout(drive_container, 2, 1)
 
         self._rebuild_drive_grid()
 
@@ -1072,6 +994,125 @@ class ConfigWindow(QWidget):
 
         main_layout.addWidget(config_card)
 
+        # ------------------------------------------------------------------
+        # 多设备分流（常驻主界面，不做独立弹窗）
+        # ------------------------------------------------------------------
+        dev_card = QFrame()
+        dev_card.setStyleSheet("""
+            QFrame {
+                background-color: #f5f5f5;
+                border: 1px solid #ddd;
+                border-radius: 6px;
+            }
+            QLabel {
+                background: transparent;
+                border: none;
+            }
+        """)
+        dev_layout = QVBoxLayout(dev_card)
+        dev_layout.setSpacing(10)
+        dev_layout.setContentsMargins(16, 16, 16, 16)
+
+        dev_head = QHBoxLayout()
+        dev_title = QLabel("多设备分流")
+        dev_title.setStyleSheet("font-weight: bold; font-size: 13px;")
+        dev_head.addWidget(dev_title)
+        dev_head.addStretch()
+        self.btn_scan = QPushButton("🔄 扫描卡内设备")
+        self.btn_scan.setStyleSheet("padding: 4px 12px; font-size: 12px;")
+        self.btn_scan.setToolTip("读取卡上照片的 EXIF，列出每台相机的序列号、机型与张数")
+        self.btn_scan.clicked.connect(self.scan_card_devices)
+        dev_head.addWidget(self.btn_scan)
+        dev_layout.addLayout(dev_head)
+
+        dev_hint = QLabel(
+            "按机身序列号分流：勾选属于你的相机 → 进各自路径；未勾选的归入 _他机；"
+            "全不勾选则按归档根目录全量导入。"
+        )
+        dev_hint.setStyleSheet("color: #666; font-size: 12px;")
+        dev_hint.setWordWrap(True)
+        dev_layout.addWidget(dev_hint)
+
+        # 归档根目录：全局唯一的路径，负责默认落盘与 _他机/_未识别 归档
+        arch_grid = QGridLayout()
+        arch_grid.setSpacing(10)
+        arch_grid.setColumnStretch(1, 1)
+        arch_grid.addWidget(QLabel("归档根目录:"), 0, 0)
+        arch_row = QHBoxLayout()
+        self.edit_path = QLineEdit()
+        self.edit_path.setPlaceholderText("例: D:\\D800E")
+        self.btn_browse = QPushButton("浏览...")
+        self.btn_browse.setFixedWidth(70)
+        self.btn_browse.clicked.connect(self.choose_path)
+        arch_row.addWidget(self.edit_path)
+        arch_row.addWidget(self.btn_browse)
+        arch_grid.addLayout(arch_row, 0, 1)
+        dev_layout.addLayout(arch_grid)
+
+        arch_note = QLabel(
+            "用途：① 无勾选时全量导入 ② 设备未填路径时用「本目录\\设备名」"
+            "③ _他机 / _未识别 归档于此。"
+        )
+        arch_note.setStyleSheet("color: #888; font-size: 12px;")
+        arch_note.setWordWrap(True)
+        dev_layout.addWidget(arch_note)
+
+        # 设备选择（下拉）
+        dev_sel = QHBoxLayout()
+        dev_sel.addWidget(QLabel("设备:"))
+        self.combo_device = QComboBox()
+        self.combo_device.setMinimumWidth(340)
+        self.combo_device.currentIndexChanged.connect(self._on_device_selected)
+        dev_sel.addWidget(self.combo_device, 1)
+        self.btn_forget = QPushButton("移除")
+        self.btn_forget.setFixedWidth(70)
+        self.btn_forget.setToolTip("从配置中删掉这台设备，之后按未配置处理")
+        self.btn_forget.clicked.connect(self.forget_device)
+        dev_sel.addWidget(self.btn_forget)
+        dev_layout.addLayout(dev_sel)
+
+        # 二级面板：随下拉选择切换内容
+        self.dev_panel = QFrame()
+        self.dev_panel.setStyleSheet(
+            "background: #ffffff; border: 1px solid #ddd; border-radius: 4px;")
+        dp = QGridLayout(self.dev_panel)
+        dp.setContentsMargins(12, 10, 12, 10)
+        dp.setSpacing(8)
+        dp.setColumnStretch(1, 1)
+
+        self.chk_dev_enabled = QCheckBox("导入此设备的照片")
+        self.chk_dev_enabled.setToolTip(
+            "总开关：取消勾选则该设备照片不导入主库，改归入 _他机")
+        self.chk_dev_enabled.toggled.connect(self._on_dev_enabled_toggled)
+        dp.addWidget(self.chk_dev_enabled, 0, 0, 1, 2)
+
+        dp.addWidget(QLabel("设备名:"), 1, 0)
+        self.edit_dev_name = QLineEdit()
+        self.edit_dev_name.setPlaceholderText("用作目录名")
+        self.edit_dev_name.editingFinished.connect(self._on_dev_field_edited)
+        dp.addWidget(self.edit_dev_name, 1, 1)
+
+        dp.addWidget(QLabel("导入路径:"), 2, 0)
+        dev_path_row = QHBoxLayout()
+        self.edit_dev_path = QLineEdit()
+        self.edit_dev_path.setPlaceholderText("留空 = 归档根目录\\设备名")
+        self.edit_dev_path.editingFinished.connect(self._on_dev_field_edited)
+        self.btn_dev_browse = QPushButton("浏览...")
+        self.btn_dev_browse.setFixedWidth(70)
+        self.btn_dev_browse.clicked.connect(self.choose_device_path)
+        dev_path_row.addWidget(self.edit_dev_path)
+        dev_path_row.addWidget(self.btn_dev_browse)
+        dp.addLayout(dev_path_row, 2, 1)
+
+        self.lbl_device_facts = QLabel("")
+        self.lbl_device_facts.setStyleSheet("color: #888; font-size: 12px;")
+        self.lbl_device_facts.setWordWrap(True)
+        dp.addWidget(self.lbl_device_facts, 3, 0, 1, 2)
+
+        dev_layout.addWidget(self.dev_panel)
+
+        main_layout.addWidget(dev_card)
+
         # 操作按钮
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(12)
@@ -1092,27 +1133,6 @@ class ConfigWindow(QWidget):
         """)
         self.btn_start.clicked.connect(self.start_import)
 
-        self.btn_split = QPushButton("🔍 多设备分流导入")
-        self.btn_split.setToolTip(
-            "扫描卡内照片，按机身序列号识别是哪台相机拍的。\n"
-            "认领自己的相机后按其分流，未认领的归入 _他机。\n"
-            "适用于：借来的卡上有别人的照片。"
-        )
-        self.btn_split.setStyleSheet("""
-            QPushButton {
-                background-color: #007bff;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 10px 20px;
-                font-weight: bold;
-                font-size: 14px;
-            }
-            QPushButton:hover { background-color: #0069d9; }
-            QPushButton:disabled { background-color: #6c757d; }
-        """)
-        self.btn_split.clicked.connect(self.start_split_import)
-
         self.btn_save = QPushButton("保存设置")
         self.btn_save.setStyleSheet("padding: 8px 20px;")
         self.btn_save.clicked.connect(self.save_settings_clicked)
@@ -1122,10 +1142,13 @@ class ConfigWindow(QWidget):
         self.btn_default.clicked.connect(self.reset_settings)
 
         btn_layout.addWidget(self.btn_start)
-        btn_layout.addWidget(self.btn_split)
         btn_layout.addStretch()
         btn_layout.addWidget(self.btn_save)
         btn_layout.addWidget(self.btn_default)
+
+        # 按钮行 + 日志区脱离滚动区：多设备面板展开时上半区会滚动，
+        # 但「开始导入」和日志必须始终可见，不能被顶出视口。
+        main_layout = outer_layout
         main_layout.addLayout(btn_layout)
 
         # 日志区
@@ -1154,6 +1177,7 @@ class ConfigWindow(QWidget):
 
         self.log = QTextEdit()
         self.log.setReadOnly(True)
+        self.log.setMinimumHeight(120)
         self.log.setLineWrapMode(QTextEdit.NoWrap)
         self.log.setStyleSheet("""
             QTextEdit {
@@ -1165,7 +1189,7 @@ class ConfigWindow(QWidget):
                 font-size: 12px;
             }
         """)
-        main_layout.addWidget(self.log, 1)
+        main_layout.addWidget(self.log, 0)
 
         log_btn_layout = QHBoxLayout()
         self.btn_stop = QPushButton("停止导入")
@@ -1183,9 +1207,17 @@ class ConfigWindow(QWidget):
         main_layout.addWidget(self.status_label)
 
     def choose_path(self):
-        path = QFileDialog.getExistingDirectory(self, "选择导入目录")
+        path = QFileDialog.getExistingDirectory(self, "选择归档根目录")
         if path:
             self.edit_path.setText(path)
+
+    def choose_device_path(self):
+        """为当前选中的设备挑一个独立路径。"""
+        start = self.edit_dev_path.text().strip() or self.edit_path.text().strip()
+        path = QFileDialog.getExistingDirectory(self, "选择该设备的导入目录", start)
+        if path:
+            self.edit_dev_path.setText(path)
+            self._on_dev_field_edited()
 
     def _rebuild_drive_grid(self):
         """根据当前系统盘符重新构建排除盘符网格，保留已勾选项。"""
@@ -1214,6 +1246,7 @@ class ConfigWindow(QWidget):
         self.status_label.setText(f"已刷新盘符列表，当前检测到 {count} 个磁盘。")
 
     def _load_settings(self):
+        self._loading = True
         self.edit_path.setText(self.settings.get("import_path", ""))
         fmt = self.settings.get("date_format", "YYYY/MMDD")
         idx = self.combo_date.findText(fmt)
@@ -1234,6 +1267,9 @@ class ConfigWindow(QWidget):
         self.chk_open_raw.setChecked("raw" in open_types)
         self.chk_open_jpg.setChecked("jpg" in open_types)
 
+        self._loading = False
+        self._refresh_device_combo()
+
     def _collect_settings(self) -> dict:
         excluded = "".join(
             letter for letter, cb in self.check_drives.items() if cb.isChecked()
@@ -1246,6 +1282,7 @@ class ConfigWindow(QWidget):
             "after_import": "open" if self.radio_open.isChecked() else "none",
             "open_scope": "all" if self.radio_scope_all.isChecked() else "latest",
             "open_types": ",".join(t for t, c in [("raw", self.chk_open_raw), ("jpg", self.chk_open_jpg)] if c.isChecked()),
+            "device_config": format_device_config(self.device_config),
         }
 
     def save_settings_clicked(self):
@@ -1267,7 +1304,12 @@ class ConfigWindow(QWidget):
         self.radio_scope_latest.setChecked(False)
         self.chk_open_raw.setChecked(True)
         self.chk_open_jpg.setChecked(True)
-        self.status_label.setText("已恢复默认设置。")
+        # 设备认领属于「身份认定」而非普通设置项：默认设置不清空它，
+        # 只把总开关全部关掉，避免误操作后还要重新扫描认领一遍。
+        for cfg in self.device_config:
+            cfg["enabled"] = False
+        self._refresh_device_combo()
+        self.status_label.setText("已恢复默认设置（设备认领已保留、开关已关闭）。")
 
     def append_log(self, text: str):
         self.log.append(text)
@@ -1284,6 +1326,8 @@ class ConfigWindow(QWidget):
         if import_path is None:
             return
 
+        # 把设备面板里可能还没提交的编辑先落进内存配置
+        self._on_dev_field_edited()
         self.save_settings_clicked()
 
         excluded = {
@@ -1296,11 +1340,21 @@ class ConfigWindow(QWidget):
         self.log.clear()
         self.progress.setValue(0)
 
+        enabled = [c for c in self.device_config if c.get("enabled")]
         self.append_log("═" * 64)
         self.append_log(f"  {APP_NAME} {APP_VERSION}")
         self.append_log("═" * 64)
+        if enabled:
+            names = "、".join(f"{c['name']}[{c['serial']}]" for c in enabled)
+            self.append_log(f"[INFO] 模式: 多设备分流（已启用 {len(enabled)} 台: {names}）")
+            self.append_log(f"[INFO] 归档根目录: {import_path}")
+            self.append_log("[INFO] 未启用设备的照片将归入 _他机，不会混进主库")
+        else:
+            self.append_log("[INFO] 模式: 全量导入（未启用任何设备）")
+            self.append_log(f"[INFO] 目标目录: {import_path}")
 
-        self._worker = ImportWorker(import_path, date_format, remark, excluded)
+        self._worker = ImportWorker(import_path, date_format, remark, excluded,
+                                    device_config=self.device_config)
         self._worker.signals.log.connect(self._on_log)
         self._worker.signals.progress.connect(self._on_progress)
         self._worker.signals.finished.connect(self._on_finished)
@@ -1333,37 +1387,199 @@ class ConfigWindow(QWidget):
 
     def _set_busy(self, busy: bool, status: str):
         self.btn_start.setEnabled(not busy)
-        self.btn_split.setEnabled(not busy)
+        self.btn_scan.setEnabled(not busy)
         self.btn_stop.setEnabled(busy)
         self.status_label.setText(status)
 
-    def start_split_import(self):
-        import_path = self._validate_path()
-        if import_path is None:
-            return
+    # ------------------------------------------------------------------
+    # 多设备分流：扫描 / 认领 / 二级面板
+    # ------------------------------------------------------------------
+    def _cfg_for(self, serial: str | None, create: bool = False) -> dict | None:
+        """取某序列号的配置条目；create=True 时不存在则新建。"""
+        if not serial:
+            return None
+        for cfg in self.device_config:
+            if cfg["serial"] == serial:
+                return cfg
+        if not create:
+            return None
+        cfg = {"serial": serial, "name": serial, "enabled": False, "path": ""}
+        self.device_config.append(cfg)
+        return cfg
 
+    @staticmethod
+    def _suggest_name(model: str, serial: str) -> str:
+        """从机型名猜一个默认设备名（如 NIKON D800E -> D800E）。"""
+        if not model:
+            return f"相机{serial[-4:]}" if serial else "相机"
+        name = model.strip()
+        for prefix in ("NIKON ", "NIKON", "Canon ", "SONY ", "Sony "):
+            if name.upper().startswith(prefix.upper()):
+                name = name[len(prefix):]
+                break
+        # 机型里的空格（如 "Z 6_2"）不适合做目录名，压成短横
+        name = name.strip().replace(" ", "-")
+        return sanitize_device_name(name) or f"相机{serial[-4:]}"
+
+    def _device_serials(self) -> list[str]:
+        """下拉框内容：已配置的设备在前，本次扫描到但未配置的在后。"""
+        serials = [c["serial"] for c in self.device_config]
+        for s in self._detected:
+            if s != UNKNOWN_DEVICE and s not in serials:
+                serials.append(s)
+        return serials
+
+    def _refresh_device_combo(self, keep_serial: str | None = None):
+        """重建设备下拉框，尽量保留当前选中项。"""
+        current = keep_serial or self.combo_device.currentData()
+        cfg_by_serial = {c["serial"]: c for c in self.device_config}
+        serials = self._device_serials()
+
+        self.combo_device.blockSignals(True)
+        self.combo_device.clear()
+        if not serials:
+            self.combo_device.addItem("（尚未扫描，点上方「扫描卡内设备」）", None)
+        for s in serials:
+            cfg = cfg_by_serial.get(s)
+            det = self._detected.get(s)
+            if cfg:
+                mark = "" if cfg.get("enabled") else "（未启用）"
+                label = f"{cfg['name']} · {s}{mark}"
+            else:
+                model = (det or {}).get("model") or "未知机型"
+                label = f"{model} · {s}（未配置）"
+            self.combo_device.addItem(label, s)
+        idx = self.combo_device.findData(current) if current else -1
+        self.combo_device.setCurrentIndex(idx if idx >= 0 else 0)
+        self.combo_device.blockSignals(False)
+
+        self._on_device_selected()
+
+    def _on_device_selected(self):
+        """二级面板跟随下拉选择刷新。"""
+        serial = self.combo_device.currentData()
+        # 没选中设备时二级面板整体隐藏，避免出现无意义的空壳表单
+        need_reveal = (
+            not self.dev_panel.isVisible() or serial != self._viewed_serial
+        )
+        self.dev_panel.setVisible(bool(serial))
+        self.dev_panel.setEnabled(bool(serial))
+        self.btn_forget.setEnabled(self._cfg_for(serial) is not None)
+        if not serial:
+            self._viewed_serial = None
+            self.lbl_device_facts.setText("")
+            return
+        if need_reveal:
+            # 面板在下半区，切换/展开后很可能落在视口之外。
+            # 延到下一轮事件循环（等布局算完）再滚进视野，否则用户会以为没反应。
+            self._viewed_serial = serial
+            QTimer.singleShot(0, lambda: self.scroll.ensureWidgetVisible(
+                self.dev_panel, 0, 16))
+
+        cfg = self._cfg_for(serial)
+        det = self._detected.get(serial) or {}
+
+        self._loading = True
+        self.chk_dev_enabled.setChecked(bool(cfg and cfg.get("enabled")))
+        self.edit_dev_name.setText(
+            cfg["name"] if cfg else self._suggest_name(det.get("model", ""), serial))
+        self.edit_dev_path.setText(cfg["path"] if cfg else "")
+        self._loading = False
+
+        # 占位提示要反映当前归档根目录，避免被误解成「路径必填」
+        main = self.edit_path.text().strip() or "归档根目录"
+        self.edit_dev_path.setPlaceholderText(
+            f"留空 = {main}\\{self.edit_dev_name.text()}")
+
+        facts = [f"序列号 {serial}"]
+        if det.get("model"):
+            facts.append(det["model"])
+        if det:
+            span = ""
+            if det.get("dmin"):
+                span = f"，{det['dmin']:%Y-%m-%d} ~ {det['dmax']:%Y-%m-%d}"
+            facts.append(f"本次检测到 {det['count']} 张"
+                         f"（RAW {det['raw']} / JPG {det['jpg']}）{span}")
+        else:
+            facts.append("本次未检测到此设备")
+        self.lbl_device_facts.setText(" · ".join(facts))
+
+    def _on_dev_enabled_toggled(self, checked: bool):
+        """总开关：勾选即把该设备写进配置并启用。"""
+        if self._loading:
+            return
+        serial = self.combo_device.currentData()
+        if not serial:
+            return
+        cfg = self._cfg_for(serial, create=checked)
+        if cfg is None:
+            return
+        cfg["enabled"] = checked
+        # 勾选瞬间把面板里已填的值一起落进配置，避免用户以为白填了
+        name = sanitize_device_name(self.edit_dev_name.text())
+        if name:
+            cfg["name"] = name
+        cfg["path"] = self.edit_dev_path.text().strip()
+        self._refresh_device_combo(keep_serial=serial)
+
+    def _on_dev_field_edited(self):
+        """设备名 / 独立路径改完后写回内存配置。"""
+        if self._loading:
+            return
+        serial = self.combo_device.currentData()
+        cfg = self._cfg_for(serial)
+        if cfg is None:
+            # 未配置的设备先不动，等勾选总开关时再建档
+            return
+        name = sanitize_device_name(self.edit_dev_name.text())
+        if name:
+            cfg["name"] = name
+        cfg["path"] = self.edit_dev_path.text().strip()
+        self._refresh_device_combo(keep_serial=serial)
+
+    def forget_device(self):
+        """从配置里移除当前设备，之后按「未配置」处理（归入 _他机）。"""
+        serial = self.combo_device.currentData()
+        cfg = self._cfg_for(serial)
+        if cfg is None:
+            return
+        if QMessageBox.question(
+            self, "移除设备",
+            f"要从配置中移除「{cfg['name']}」（序列号 {serial}）吗？\n"
+            "移除后它的照片会归入 _他机，可随时重新扫描认领。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        ) != QMessageBox.Yes:
+            return
+        name = cfg["name"]
+        self.device_config = [c for c in self.device_config if c["serial"] != serial]
+        self._refresh_device_combo()
+        self.status_label.setText(f"已移除设备「{name}」。")
+
+    def scan_card_devices(self):
+        """扫描卡内照片，按机身序列号统计，结果填进下拉框。"""
         excluded = {
             letter for letter, cb in self.check_drives.items() if cb.isChecked()
         }
-
-        self.save_settings_clicked()
-        self._set_busy(True, "正在扫描设备...")
-        self.log.clear()
-        self.progress.setValue(0)
-        self.append_log("═" * 64)
-        self.append_log(f"  {APP_NAME} {APP_VERSION} · 多设备分流")
-        self.append_log("═" * 64)
+        self.btn_scan.setEnabled(False)
+        self.btn_start.setEnabled(False)
+        self.status_label.setText("正在扫描卡内设备...")
+        self.append_log("[SCAN] 开始扫描卡内设备...")
 
         self._scanner = ScanWorker(excluded)
         self._scanner.signals.log.connect(self._on_log)
-        self._scanner.signals.devices.connect(
-            lambda stats: self._on_scan_done(stats, import_path, excluded))
+        self._scanner.signals.devices.connect(self._on_scan_done)
         self._scanner.finished.connect(self._scanner.deleteLater)
         self._scanner.start()
 
-    def _on_scan_done(self, stats: dict, import_path: Path, excluded: set):
-        if not stats:
-            self._set_busy(False, "未检测到设备。")
+    def _on_scan_done(self, stats: dict):
+        self.btn_scan.setEnabled(True)
+        self.btn_start.setEnabled(True)
+        self._detected = stats or {}
+
+        if not self._detected:
+            self.status_label.setText("未检测到设备。")
+            self.append_log("[WARNING] 未检测到含 DCIM 目录的设备。")
+            self._refresh_device_combo()
             QMessageBox.information(
                 self, "未找到设备",
                 "没有检测到含 DCIM 目录的存储设备。\n"
@@ -1371,41 +1587,28 @@ class ConfigWindow(QWidget):
             )
             return
 
-        claimed = parse_device_map(self.settings.get("device_map", ""))
-        dialog = DeviceDialog(stats, claimed, import_path, self)
-        if dialog.exec_() != QDialog.Accepted:
-            self._set_busy(False, "已取消。")
-            self.append_log("[ABORT] 用户取消了设备认领。")
-            return
+        # 新扫描到的设备先按机型给个建议名建档（默认不启用），
+        # 这样下拉框里能直接看懂是哪台，勾一下就能用。
+        for serial, entry in self._detected.items():
+            if serial == UNKNOWN_DEVICE or self._cfg_for(serial):
+                continue
+            model = entry.get("model", "")
+            if model:
+                self.device_config.append({
+                    "serial": serial,
+                    "name": self._suggest_name(model, serial),
+                    "enabled": False,
+                    "path": "",
+                })
 
-        device_map = dialog.result_map
-        # 认领结果写回注册表，下次插同一张卡无需重填
-        self.settings["device_map"] = format_device_map(device_map)
+        self._refresh_device_combo()
+        # 立刻落盘，避免用户忘了点「保存设置」而丢掉这次认领结果
         self.config.save(self._collect_settings())
 
-        if device_map:
-            self.append_log("[INFO] 已认领设备: " + ", ".join(
-                f"{name}[{serial}]" for serial, name in device_map.items()))
-        else:
-            self.append_log("[INFO] 未认领任何设备，全部归入 _他机。")
-
-        self._set_busy(True, "正在分流导入...")
-        self.progress.setValue(0)
-
-        self._worker = ImportWorker(
-            import_path,
-            self.combo_date.currentText(),
-            self.edit_remark.text().strip(),
-            excluded,
-            device_map=device_map,
-            scanned=stats,
-        )
-        self._worker.signals.log.connect(self._on_log)
-        self._worker.signals.progress.connect(self._on_progress)
-        self._worker.signals.finished.connect(self._on_finished)
-        self._worker.finished.connect(self._worker.deleteLater)
-        self.btn_stop.clicked.connect(self._worker.abort)
-        self._worker.start()
+        self.status_label.setText(
+            f"扫描完成，检测到 {len(self._detected)} 组设备，请勾选要导入的相机。")
+        self.append_log(
+            f"[SCAN] 完成，共 {len(self._detected)} 组设备，请勾选要导入的相机。")
 
     def _on_log(self, text: str):
         self.append_log(text)
