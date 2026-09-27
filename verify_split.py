@@ -200,6 +200,80 @@ def main():
                           "enabled": False, "path": ""}], stats, card, use_run=True)
         f4 = [str(p.relative_to(out4)) for p in sorted(out4.rglob("*")) if p.is_file()]
         check("全关时走全量（5 个文件）", len(f4) == 5, str(len(f4)))
+
+        print()
+        print("=" * 68)
+        print("10. EXIF 快路径：与历史直读对拍 + 目录换机预检")
+        print("=" * 68)
+        check("快路径与直读结果逐项一致（5 个真实夹具）",
+              all(pit.read_photo_meta(p) == pit._read_photo_meta_direct(p)
+                  for p in FIXTURES.values()))
+        check("大块读窗口 >= 256KB（NEF MakerNote 实测下限）",
+              pit.SCAN_HEAD_BYTES >= 256 * 1024, str(pit.SCAN_HEAD_BYTES))
+
+        def fake_group(names):
+            # _dir_name_restart 只看文件名，不做 IO，路径不必真实存在
+            return [(dcim / n, 0.0) for n in names]
+
+        check("序号单调递增 → 不判为换机",
+              not pit._dir_name_restart(fake_group(
+                  [f"XYL_{i}.JPG" for i in range(4900, 4913)])))
+        check("序号大幅回退（换机重启）→ 判为换机",
+              pit._dir_name_restart(fake_group(
+                  [f"XYL_{i}.JPG" for i in range(4900, 4908)]
+                  + ["XYL_0001.JPG", "XYL_0002.JPG"])))
+        check("序号小回退（删除/重拍）→ 不误判",
+              not pit._dir_name_restart(fake_group(
+                  ["XYL_1706.JPG", "XYL_1707.JPG", "XYL_1708.JPG",
+                   "XYL_1705.JPG", "XYL_1709.JPG"])))
+        check("RAW/JPG 分段交界 → 不误判",
+              not pit._dir_name_restart(fake_group(
+                  [f"DSC_{i}.NEF" for i in range(1529, 1560)]
+                  + [f"DSC_{i}.JPG" for i in range(1529, 1560)])))
+
+        print()
+        print("=" * 68)
+        print("11. 目录采样：同机目录抽样识别，且与全读等价")
+        print("=" * 68)
+        pure = tmp / "card_pure"
+        pdir = pure / pit.DCIM_NAME / "100PURE"
+        pdir.mkdir(parents=True)
+        for i in range(13):
+            shutil.copy2(FIXTURES["mine_jpg"], pdir / f"XYL_{4900 + i}.JPG")
+
+        reads = {"n": 0}
+        real_meta = pit.read_photo_meta
+
+        def counting_meta(path):
+            reads["n"] += 1
+            return real_meta(path)
+
+        pit.read_photo_meta = counting_meta
+        try:
+            s_sample = pit.scan_devices([pure])
+        finally:
+            pit.read_photo_meta = real_meta
+        sampled_reads = reads["n"]
+
+        saved_probe = pit.DIR_PROBE_COUNT
+        pit.DIR_PROBE_COUNT = 10 ** 9       # 强制逐张，等价于全读
+        try:
+            s_full = pit.scan_devices([pure])
+        finally:
+            pit.DIR_PROBE_COUNT = saved_probe
+
+        print(f"    采样读取 {sampled_reads}/13 张；计数 采样="
+              f"{s_sample.get('9004185', {}).get('count')} / 全读="
+              f"{s_full.get('9004185', {}).get('count')}")
+        check("同机目录 13 张全部归同一机身",
+              s_sample.get("9004185", {}).get("count") == 13)
+        check("抽样确实生效（读取张数 < 13）", sampled_reads < 13, str(sampled_reads))
+        check("采样与全读的计数一致",
+              s_sample.get("9004185", {}).get("count")
+              == s_full.get("9004185", {}).get("count"))
+        check("采样与全读的机型一致",
+              s_sample.get("9004185", {}).get("model")
+              == s_full.get("9004185", {}).get("model"))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
