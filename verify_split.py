@@ -154,10 +154,11 @@ def main():
         check("本机照片进独立路径", len(own_files) == 2, str(len(own_files)))
         check("本机路径含 raw/jpg 分层", "\\raw\\" in joined_own and "\\jpg\\" in joined_own)
         check("本机路径不含设备名子目录", "D800E" not in joined_own)
-        check("未勾选设备进 _他机\\8105412",
-              "_他机" in joined_arch and "8105412" in joined_arch)
-        check("无序列号进 _未识别", "_未识别" in joined_arch)
-        check("归档根目录只有他机与未识别", len(arch) == 3, str(len(arch)))
+        check("未勾选设备按机器名建目录（不再有 _他机）",
+              "Z-6_2" in joined_arch and "_他机" not in joined_arch)
+        check("无序列号按机型建目录（不再有 _未识别）",
+              "_未识别" not in joined_arch and "D800E" in joined_arch)
+        check("归档根目录 3 个文件", len(arch) == 3, str(len(arch)))
         check("他机文件未混入本机路径", not any("DSC_" in f for f in own_files))
 
         print()
@@ -173,13 +174,14 @@ def main():
             print(f"    {f}")
         joined2 = "\n".join(f2)
         check("落到 归档根目录\\D800E", any("D800E" in f for f in f2))
-        check("未勾选的他机仍进 _他机", "_他机" in joined2)
-        check("未识别仍进 _未识别", "_未识别" in joined2)
+        check("未认领设备按机器名建目录", "Z-6_2" in joined2)
+        check("无 _他机 / _未识别 残留",
+              "_他机" not in joined2 and "_未识别" not in joined2)
         check("共 5 个文件", len(f2) == 5, str(len(f2)))
 
         print()
         print("=" * 68)
-        print("8. 未启用任何设备 → 回落全量模式")
+        print("8. 一台设备都没认领 → 回落全量模式")
         print("=" * 68)
         out3 = tmp / "out3"
         out3.mkdir()
@@ -188,18 +190,23 @@ def main():
         check("全量模式 5 个文件", len(f3) == 5, str(len(f3)))
         check("无设备分层，直接 日期/raw|jpg",
               all(("\\raw\\" in f or "\\jpg\\" in f) for f in f3)
-              and not any("D800E" in f or "_他机" in f for f in f3))
+              and not any("D800E" in f or "Z-6_2" in f for f in f3))
 
         print()
         print("=" * 68)
-        print("9. 设备存在但全部关闭 → 同样回落全量")
+        print("9. 已认领但未勾选 → 仍走分流（按机器名，不再回落全量）")
         print("=" * 68)
         out4 = tmp / "out4"
         out4.mkdir()
         run_split(out4, [{"serial": "9004185", "name": "D800E",
                           "enabled": False, "path": ""}], stats, card, use_run=True)
         f4 = [str(p.relative_to(out4)) for p in sorted(out4.rglob("*")) if p.is_file()]
-        check("全关时走全量（5 个文件）", len(f4) == 5, str(len(f4)))
+        for f in f4:
+            print(f"    {f}")
+        joined4 = "\n".join(f4)
+        check("未勾选也走分流（5 个文件）", len(f4) == 5, str(len(f4)))
+        check("未勾选的 D800E 落 归档根目录\\D800E", "D800E" in joined4)
+        check("未认领的 Z-6_2 落 归档根目录\\Z-6_2", "Z-6_2" in joined4)
 
         print()
         print("=" * 68)
@@ -274,6 +281,35 @@ def main():
         check("采样与全读的机型一致",
               s_sample.get("9004185", {}).get("model")
               == s_full.get("9004185", {}).get("model"))
+
+        print()
+        print("=" * 68)
+        print("12. 目录名推断：未勾选/未认领的机器怎么命名")
+        print("=" * 68)
+        check("NIKON D800E → D800E",
+              pit.suggest_device_name("NIKON D800E", "9004185") == "D800E")
+        check("NIKON Z 6_2 → Z-6_2",
+              pit.suggest_device_name("NIKON Z 6_2", "8105412") == "Z-6_2")
+        check("Canon EOS R6 → EOS-R6",
+              pit.suggest_device_name("Canon EOS R6", "1") == "EOS-R6")
+        check("机型为空 → 相机+序列号后四位",
+              pit.suggest_device_name("", "9004185") == "相机4185")
+        check("机型与序列号都空 → 相机", pit.suggest_device_name("", "") == "相机")
+        check("只写了厂商名 → 兜底到序列号",
+              pit.suggest_device_name("NIKON", "9004185") == "相机4185")
+
+        check("已配置设备优先用配置名",
+              pit.device_dir_name({"name": "z62", "serial": "1"},
+                                  {"model": "NIKON Z 6_2", "serial": "1"}) == "z62")
+        check("未认领设备用机型推断",
+              pit.device_dir_name(None, {"model": "NIKON D800E", "serial": "9004185"})
+              == "D800E")
+        check("未认领且无机型 → 序列号兜底",
+              pit.device_dir_name(None, {"model": "", "serial": "9004185"})
+              == "相机4185")
+        check("设备名里的非法字符被清理",
+              pit.device_dir_name({"name": "D800E:A/B", "serial": "1"}, {})
+              == "D800E_A_B")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
